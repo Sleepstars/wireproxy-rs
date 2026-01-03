@@ -13,7 +13,7 @@ use base64::Engine;
 use boringtun::device::allowed_ips::AllowedIps;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
-use rand::{Rng, RngCore};
+use rand::RngCore;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::{icmp, tcp, udp};
 use smoltcp::wire::{
@@ -211,7 +211,7 @@ impl WireguardRuntime {
         let ident: u16 = rand::random();
         let seq_no: u16 = rand::random();
         let mut payload = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut payload);
+        rand::rng().fill_bytes(&mut payload);
 
         let (handle, target_addr, v6_src) = {
             let mut state = self.inner.state.lock().await;
@@ -259,8 +259,7 @@ impl WireguardRuntime {
                     let src_addr = state
                         .netstack
                         .iface
-                        .get_source_address_ipv6(&dst_addr)
-                        .ok_or_else(|| anyhow::anyhow!("no IPv6 source address for {dst}"))?;
+                        .get_source_address_ipv6(&dst_addr);
                     let repr = Icmpv6Repr::EchoRequest {
                         ident,
                         seq_no,
@@ -268,8 +267,8 @@ impl WireguardRuntime {
                     };
                     let mut buf = vec![0u8; repr.buffer_len()];
                     repr.emit(
-                        &IpAddress::Ipv6(src_addr),
-                        &IpAddress::Ipv6(dst_addr),
+                        &src_addr,
+                        &dst_addr,
                         &mut Icmpv6Packet::new_unchecked(&mut buf),
                         &ChecksumCapabilities::default(),
                     );
@@ -876,8 +875,8 @@ fn matches_echo_reply(
             };
             matches!(
                 Icmpv6Repr::parse(
-                    &IpAddress::Ipv6(src),
-                    &IpAddress::Ipv6(dst),
+                    &src,
+                    &dst,
                     &packet,
                     &ChecksumCapabilities::ignored(),
                 ),
@@ -940,6 +939,5 @@ fn process_datagram(
 }
 
 fn random_ephemeral_port() -> u16 {
-    let mut rng = rand::thread_rng();
-    rng.gen_range(49152..65535)
+    rand::random_range(49152..65535)
 }

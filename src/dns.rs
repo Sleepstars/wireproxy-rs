@@ -1,9 +1,9 @@
 use std::net::{IpAddr, SocketAddr};
 
 use anyhow::Context;
-use trust_dns_proto::op::{Message, MessageType, OpCode, Query};
-use trust_dns_proto::rr::{Name, RData, RecordType};
-use trust_dns_proto::serialize::binary::{BinEncodable, BinEncoder};
+use hickory_proto::op::{Message, MessageType, OpCode, Query};
+use hickory_proto::rr::{Name, RData, RecordType};
+use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 
 use crate::wg::WireguardRuntime;
 
@@ -69,12 +69,11 @@ async fn query_dns(
 
     let message = Message::from_vec(&response).context("decode dns response")?;
     for answer in message.answers() {
-        if let Some(rdata) = answer.data() {
-            match rdata {
-                RData::A(ip) => return Ok(IpAddr::V4(ip.0)),
-                RData::AAAA(ip) => return Ok(IpAddr::V6(ip.0)),
-                _ => {}
-            }
+        let rdata = answer.data();
+        match rdata {
+            RData::A(ip) => return Ok(IpAddr::V4(ip.0)),
+            RData::AAAA(ip) => return Ok(IpAddr::V6(ip.0)),
+            _ => {}
         }
     }
 

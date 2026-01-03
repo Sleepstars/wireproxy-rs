@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::time::Instant as StdInstant;
 
 use rand::RngCore;
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address};
@@ -18,7 +18,7 @@ impl Netstack {
     pub(crate) fn new(addresses: &[std::net::IpAddr], mtu: usize) -> Self {
         let mut device = IpDevice::new(mtu);
         let mut config = Config::new(HardwareAddress::Ip);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         config.random_seed = rng.next_u64();
         let now = Instant::from_millis(0i64);
         let mut iface = Interface::new(config, &mut device, now);
@@ -73,7 +73,7 @@ impl Netstack {
 
     pub(crate) fn poll(&mut self) -> bool {
         let now = self.now();
-        self.iface.poll(now, &mut self.device, &mut self.sockets)
+        self.iface.poll(now, &mut self.device, &mut self.sockets) != PollResult::None
     }
 
     pub(crate) fn poll_delay(&mut self) -> Option<std::time::Duration> {
@@ -139,11 +139,11 @@ pub(crate) struct IpRxToken {
 }
 
 impl RxToken for IpRxToken {
-    fn consume<R, F>(mut self, f: F) -> R
+    fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
-        f(&mut self.buffer)
+        f(&self.buffer)
     }
 }
 
