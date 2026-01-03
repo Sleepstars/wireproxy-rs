@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -13,18 +11,21 @@ use base64::Engine;
 use boringtun::device::allowed_ips::AllowedIps;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
+use bytes::Bytes;
+use parking_lot::{Mutex, RwLock};
 use rand::RngCore;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::{icmp, tcp, udp};
 use smoltcp::wire::{
-    Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress, IpEndpoint,
-    IpListenEndpoint, Ipv4Address, Ipv6Address,
+    Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress, IpEndpoint, IpListenEndpoint,
+    Ipv4Address, Ipv6Address,
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
 
+use crate::buffer::BufferPool;
 use crate::config::{DeviceConfig, PeerConfig};
 use crate::netstack::Netstack;
 
@@ -38,27 +39,47 @@ const UDP_TX_BUFFER: usize = 2048;
 const ICMP_RX_BUFFER: usize = 256;
 const ICMP_TX_BUFFER: usize = 256;
 
+/// Outbound datagram for UDP sending (zero-copy with Bytes)
+pub struct Datagram {
+    pub endpoint: SocketAddr,
+    pub data: Bytes,
+}
+
 #[derive(Clone)]
 pub struct WireguardRuntime {
     inner: Arc<Inner>,
 }
 
 struct Inner {
-    state: Mutex<State>,
+    /// Network stack - protected by its own lock (high contention)
+    netstack: Mutex<Netstack>,
+    /// Peer states - protected by RwLock for read-heavy access
+    peers: RwLock<PeerManager>,
+    /// UDP socket - Arc for sharing without lock
+    udp: Arc<UdpSocket>,
+    /// Channel for outbound datagrams (event-driven)
+    outbound_tx: mpsc::UnboundedSender<Datagram>,
+    /// Notify for netstack events
     notify: Notify,
+    /// Started flag
     started: AtomicBool,
+    /// DNS servers
     dns_servers: Vec<IpAddr>,
+    /// Private key for metrics
     private_key: [u8; 32],
+    /// Listen port for metrics
     listen_port: Option<u16>,
+    /// MTU
+    #[allow(dead_code)]
+    mtu: usize,
+    /// Buffer pool for reducing allocations
+    buffer_pool: Arc<BufferPool>,
 }
 
-struct State {
-    netstack: Netstack,
+struct PeerManager {
     peers: Vec<PeerState>,
     peer_by_endpoint: HashMap<SocketAddr, usize>,
     allowed_ips: AllowedIps<usize>,
-    udp: Arc<UdpSocket>,
-    mtu: usize,
 }
 
 struct PeerState {
@@ -68,11 +89,10 @@ struct PeerState {
 }
 
 impl PeerState {
-    /// Format public key like wireguard-go: "(+zv+…vLBQ)"
     fn short_id(&self) -> String {
         let b64 = BASE64_STD.encode(self.config.public_key);
         if b64.len() >= 8 {
-            format!("({}…{})", &b64[..4], &b64[b64.len()-4..])
+            format!("({}…{})", &b64[..4], &b64[b64.len() - 4..])
         } else {
             format!("({})", b64)
         }
@@ -116,25 +136,34 @@ impl WireguardRuntime {
             });
         }
 
-        let state = State {
-            netstack,
+        let peer_manager = PeerManager {
             peers,
             peer_by_endpoint,
             allowed_ips,
-            udp,
-            mtu,
         };
 
-        Ok(WireguardRuntime {
-            inner: Arc::new(Inner {
-                state: Mutex::new(state),
-                notify: Notify::new(),
-                started: AtomicBool::new(false),
-                dns_servers: config.dns.clone(),
-                private_key: config.private_key,
-                listen_port: config.listen_port,
-            }),
-        })
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+        let buffer_pool = Arc::new(BufferPool::new(128, 64));
+
+        let inner = Arc::new(Inner {
+            netstack: Mutex::new(netstack),
+            peers: RwLock::new(peer_manager),
+            udp: udp.clone(),
+            outbound_tx,
+            notify: Notify::new(),
+            started: AtomicBool::new(false),
+            dns_servers: config.dns.clone(),
+            private_key: config.private_key,
+            listen_port: config.listen_port,
+            mtu,
+            buffer_pool,
+        });
+
+        // Spawn the event-driven outbound sender task
+        let udp_clone = udp.clone();
+        tokio::spawn(outbound_sender_loop(udp_clone, outbound_rx));
+
+        Ok(WireguardRuntime { inner })
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -156,7 +185,8 @@ impl WireguardRuntime {
     }
 
     pub async fn metrics(&self) -> String {
-        let state = self.inner.state.lock().await;
+        // Use read lock for peers - no mutation needed
+        let peers = self.inner.peers.read();
         let mut out = String::new();
 
         let _ = writeln!(&mut out, "protocol_version=1");
@@ -165,7 +195,7 @@ impl WireguardRuntime {
             let _ = writeln!(&mut out, "listen_port={}", port);
         }
 
-        for peer in &state.peers {
+        for peer in &peers.peers {
             let _ = writeln!(&mut out, "public_key={}", encode_key(&peer.config.public_key));
             if peer.config.preshared_key != [0u8; 32] {
                 let _ = writeln!(
@@ -214,7 +244,7 @@ impl WireguardRuntime {
         rand::rng().fill_bytes(&mut payload);
 
         let (handle, target_addr, v6_src) = {
-            let mut state = self.inner.state.lock().await;
+            let mut netstack = self.inner.netstack.lock();
             let rx = icmp::PacketBuffer::new(
                 vec![icmp::PacketMetadata::EMPTY; 4],
                 vec![0u8; ICMP_RX_BUFFER],
@@ -227,14 +257,13 @@ impl WireguardRuntime {
             socket
                 .bind(icmp::Endpoint::Ident(ident))
                 .map_err(|e| anyhow::anyhow!("icmp bind error: {e:?}"))?;
-            let handle = state.netstack.add_socket(socket);
+            let handle = netstack.add_socket(socket);
 
             let target_addr = to_ip_address(target);
             let v6_src = match target {
                 IpAddr::V4(dst) => {
                     let dst_addr = Ipv4Address::from(dst);
-                    let _src_addr = state
-                        .netstack
+                    let _src_addr = netstack
                         .iface
                         .get_source_address_ipv4(&dst_addr)
                         .ok_or_else(|| anyhow::anyhow!("no IPv4 source address for {dst}"))?;
@@ -248,7 +277,7 @@ impl WireguardRuntime {
                         &mut Icmpv4Packet::new_unchecked(&mut buf),
                         &ChecksumCapabilities::default(),
                     );
-                    let socket = state.netstack.sockets.get_mut::<icmp::Socket>(handle);
+                    let socket = netstack.sockets.get_mut::<icmp::Socket>(handle);
                     socket
                         .send_slice(&buf, target_addr)
                         .map_err(|e| anyhow::anyhow!("icmp send error: {e:?}"))?;
@@ -256,10 +285,7 @@ impl WireguardRuntime {
                 }
                 IpAddr::V6(dst) => {
                     let dst_addr = Ipv6Address::from(dst);
-                    let src_addr = state
-                        .netstack
-                        .iface
-                        .get_source_address_ipv6(&dst_addr);
+                    let src_addr = netstack.iface.get_source_address_ipv6(&dst_addr);
                     let repr = Icmpv6Repr::EchoRequest {
                         ident,
                         seq_no,
@@ -272,7 +298,7 @@ impl WireguardRuntime {
                         &mut Icmpv6Packet::new_unchecked(&mut buf),
                         &ChecksumCapabilities::default(),
                     );
-                    let socket = state.netstack.sockets.get_mut::<icmp::Socket>(handle);
+                    let socket = netstack.sockets.get_mut::<icmp::Socket>(handle);
                     socket
                         .send_slice(&buf, target_addr)
                         .map_err(|e| anyhow::anyhow!("icmp send error: {e:?}"))?;
@@ -288,66 +314,53 @@ impl WireguardRuntime {
         let deadline = Instant::now() + timeout;
         let mut recv_buf = [0u8; 512];
         loop {
-            let mut state = self.inner.state.lock().await;
-            let maybe_reply = {
-                let socket = state.netstack.sockets.get_mut::<icmp::Socket>(handle);
+            {
+                let mut netstack = self.inner.netstack.lock();
+                let socket = netstack.sockets.get_mut::<icmp::Socket>(handle);
                 if socket.can_recv() {
                     let (len, from) = socket
                         .recv_slice(&mut recv_buf)
                         .map_err(|e| anyhow::anyhow!("icmp recv error: {e:?}"))?;
-                    Some((len, from))
-                } else {
-                    None
-                }
-            };
-
-            if let Some((len, from)) = maybe_reply {
-                if from == target_addr
-                    && matches_echo_reply(
-                        &recv_buf[..len],
-                        target_addr,
-                        v6_src,
-                        ident,
-                        seq_no,
-                    )
-                {
-                    state.netstack.sockets.remove(handle);
-                    self.inner.notify.notify_waiters();
-                    return Ok(());
+                    if from == target_addr
+                        && matches_echo_reply(&recv_buf[..len], target_addr, v6_src, ident, seq_no)
+                    {
+                        netstack.sockets.remove(handle);
+                        self.inner.notify.notify_waiters();
+                        return Ok(());
+                    }
                 }
             }
 
             if Instant::now() >= deadline {
-                state.netstack.sockets.remove(handle);
+                let mut netstack = self.inner.netstack.lock();
+                netstack.sockets.remove(handle);
                 self.inner.notify.notify_waiters();
                 anyhow::bail!("icmp ping timed out");
             }
 
-            drop(state);
             self.inner.notify.notified().await;
         }
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> anyhow::Result<WgTcpConnection> {
         let handle = {
-            let mut state = self.inner.state.lock().await;
-            if state.allowed_ips.find(addr.ip()).is_none() {
+            let peers = self.inner.peers.read();
+            if peers.allowed_ips.find(addr.ip()).is_none() {
                 anyhow::bail!("no peer for destination {addr}");
             }
+            drop(peers);
 
+            let mut netstack = self.inner.netstack.lock();
             let rx = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER]);
             let tx = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER]);
             let mut socket = tcp::Socket::new(rx, tx);
             socket.set_nagle_enabled(false);
 
-            let handle = state.netstack.add_socket(socket);
+            let handle = netstack.add_socket(socket);
             let local_port = random_ephemeral_port();
-            let netstack = &mut state.netstack;
-            let (iface, sockets) = (&mut netstack.iface, &mut netstack.sockets);
-            let socket = sockets.get_mut::<tcp::Socket>(handle);
-            socket
-                .connect(
-                    iface.context(),
+            netstack
+                .tcp_connect(
+                    handle,
                     IpEndpoint::new(to_ip_address(addr.ip()), addr.port()),
                     IpListenEndpoint::from(local_port),
                 )
@@ -374,45 +387,43 @@ impl WireguardRuntime {
 
     pub async fn accept(&self, port: u16) -> anyhow::Result<WgTcpConnection> {
         let handle = {
-            let mut state = self.inner.state.lock().await;
+            let mut netstack = self.inner.netstack.lock();
             let rx = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER]);
             let tx = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER]);
             let mut socket = tcp::Socket::new(rx, tx);
             socket
                 .listen(IpListenEndpoint::from(port))
                 .map_err(|e| anyhow::anyhow!("tcp listen error: {e:?}"))?;
-            state.netstack.add_socket(socket)
+            netstack.add_socket(socket)
         };
 
         self.inner.notify.notify_waiters();
 
         loop {
-            let mut state = self.inner.state.lock().await;
-            let socket = state
-                .netstack
-                .sockets
-                .get_mut::<tcp::Socket>(handle);
-            match socket.state() {
-                tcp::State::Established => {
-                    return Ok(WgTcpConnection {
-                        handle: Arc::new(std::sync::Mutex::new(Some(handle))),
-                        runtime: self.clone(),
-                    })
+            {
+                let mut netstack = self.inner.netstack.lock();
+                let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
+                match socket.state() {
+                    tcp::State::Established => {
+                        return Ok(WgTcpConnection {
+                            handle: Arc::new(std::sync::Mutex::new(Some(handle))),
+                            runtime: self.clone(),
+                        })
+                    }
+                    tcp::State::Closed => {
+                        netstack.sockets.remove(handle);
+                        anyhow::bail!("listener closed before accept");
+                    }
+                    _ => {}
                 }
-                tcp::State::Closed => {
-                    state.netstack.sockets.remove(handle);
-                    anyhow::bail!("listener closed before accept");
-                }
-                _ => {}
             }
-            drop(state);
             self.inner.notify.notified().await;
         }
     }
 
     pub async fn udp_exchange(&self, target: SocketAddr, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
         let handle = {
-            let mut state = self.inner.state.lock().await;
+            let mut netstack = self.inner.netstack.lock();
             let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; UDP_RX_BUFFER]);
             let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; UDP_TX_BUFFER]);
             let mut socket = udp::Socket::new(rx, tx);
@@ -420,8 +431,8 @@ impl WireguardRuntime {
             socket
                 .bind(IpListenEndpoint::from(local_port))
                 .map_err(|e| anyhow::anyhow!("udp bind error: {e:?}"))?;
-            let handle = state.netstack.add_socket(socket);
-            let socket = state.netstack.sockets.get_mut::<udp::Socket>(handle);
+            let handle = netstack.add_socket(socket);
+            let socket = netstack.sockets.get_mut::<udp::Socket>(handle);
             socket
                 .send_slice(
                     payload,
@@ -435,27 +446,23 @@ impl WireguardRuntime {
 
         let deadline = tokio::time::Instant::now() + DNS_TIMEOUT;
         loop {
-            let mut state = self.inner.state.lock().await;
-            let payload = {
-                let socket = state.netstack.sockets.get_mut::<udp::Socket>(handle);
+            {
+                let mut netstack = self.inner.netstack.lock();
+                let socket = netstack.sockets.get_mut::<udp::Socket>(handle);
                 if socket.can_recv() {
                     let (data, _) = socket
                         .recv()
                         .map_err(|e| anyhow::anyhow!("udp recv error: {e:?}"))?;
-                    Some(data.to_vec())
-                } else {
-                    None
+                    let result = data.to_vec();
+                    netstack.sockets.remove(handle);
+                    return Ok(result);
                 }
-            };
-            if let Some(payload) = payload {
-                state.netstack.sockets.remove(handle);
-                return Ok(payload);
             }
             if tokio::time::Instant::now() >= deadline {
-                state.netstack.sockets.remove(handle);
+                let mut netstack = self.inner.netstack.lock();
+                netstack.sockets.remove(handle);
                 anyhow::bail!("udp exchange timed out");
             }
-            drop(state);
             self.inner.notify.notified().await;
         }
     }
@@ -475,13 +482,14 @@ impl WireguardRuntime {
         tokio::spawn(async move { runtime.timer_loop().await });
     }
 
+    /// Event-driven poll loop - wakes on notify or timeout
     async fn poll_loop(&self) {
         loop {
             let (frames, did_work, delay) = {
-                let mut state = self.inner.state.lock().await;
-                let did_work = state.netstack.poll();
-                let frames = state.netstack.drain_outbound();
-                let delay = state.netstack.poll_delay();
+                let mut netstack = self.inner.netstack.lock();
+                let did_work = netstack.poll();
+                let frames = netstack.drain_outbound();
+                let delay = netstack.poll_delay();
                 (frames, did_work, delay)
             };
 
@@ -489,15 +497,14 @@ impl WireguardRuntime {
                 self.inner.notify.notify_waiters();
             }
 
-            if let Err(err) = self.send_frames(frames).await {
-                log::error!("failed sending frames: {err:#}");
+            if !frames.is_empty() {
+                self.send_frames(frames);
             }
 
-            // Use smoltcp's poll_delay for precise timing, with a small fallback
-            // to avoid busy-looping while still being responsive
+            // Event-driven: wait for notify or smoltcp's poll_delay
             let sleep_duration = delay
                 .filter(|d| *d > Duration::ZERO)
-                .unwrap_or(Duration::from_millis(1));
+                .unwrap_or(Duration::from_millis(5));
 
             tokio::select! {
                 biased;
@@ -508,13 +515,9 @@ impl WireguardRuntime {
     }
 
     async fn udp_loop(&self) {
-        let udp = {
-            let state = self.inner.state.lock().await;
-            state.udp.clone()
-        };
-        let mut buffer = vec![0u8; 65535];
+        let mut buffer = self.inner.buffer_pool.get_large();
         loop {
-            let (len, src) = match udp.recv_from(&mut buffer).await {
+            let (len, src) = match self.inner.udp.recv_from(&mut buffer.buf[..]).await {
                 Ok(result) => result,
                 Err(err) => {
                     log::error!("udp recv error: {err}");
@@ -522,29 +525,31 @@ impl WireguardRuntime {
                 }
             };
 
-            if let Err(err) = self.handle_incoming(src, &buffer[..len]).await {
+            if let Err(err) = self.handle_incoming(src, &buffer.buf[..len]) {
                 log::error!("failed handling udp packet: {err:#}");
             }
         }
     }
 
     async fn timer_loop(&self) {
+        let mut timer_buf = [0u8; 256];
+        
         loop {
-            let datagrams = {
-                let mut state = self.inner.state.lock().await;
-                let mut datagrams = Vec::new();
-                for peer in &mut state.peers {
-                    let mut buf = vec![0u8; 256];
-                    match peer.tunn.update_timers(&mut buf) {
+            {
+                let mut peers = self.inner.peers.write();
+                for peer in &mut peers.peers {
+                    match peer.tunn.update_timers(&mut timer_buf) {
                         TunnResult::WriteToNetwork(packet) => {
-                            // Handshake initiation is 148 bytes, keepalive is smaller
                             let msg_type = if packet.len() >= 148 {
                                 "Sending handshake initiation"
                             } else {
                                 "Sending keepalive packet"
                             };
                             log::debug!("peer{} - {}", peer.short_id(), msg_type);
-                            datagrams.push((peer.endpoint, packet.to_vec()));
+                            let _ = self.inner.outbound_tx.send(Datagram {
+                                endpoint: peer.endpoint,
+                                data: Bytes::copy_from_slice(packet),
+                            });
                         }
                         TunnResult::Err(err) => {
                             log::warn!("peer{} - timer error: {err:?}", peer.short_id());
@@ -552,106 +557,73 @@ impl WireguardRuntime {
                         _ => {}
                     }
                 }
-                datagrams
-            };
-
-            for (endpoint, packet) in datagrams {
-                if let Err(err) = self.send_datagram(endpoint, packet).await {
-                    log::error!("failed sending to {endpoint}: {err:#}");
-                }
             }
 
             tokio::time::sleep(TIMER_INTERVAL).await;
         }
     }
 
-    async fn send_frames(&self, frames: Vec<Vec<u8>>) -> anyhow::Result<()> {
-        if frames.is_empty() {
-            return Ok(());
-        }
+    fn send_frames(&self, frames: Vec<Vec<u8>>) {
+        let mut peers = self.inner.peers.write();
+        let mut buf = self.inner.buffer_pool.get_small();
 
-        let datagrams = {
-            let mut state = self.inner.state.lock().await;
-            let mut datagrams = Vec::new();
-
-            for frame in frames {
-                let dst = match dst_ip(&frame) {
-                    Some(dst) => dst,
-                    None => {
-                        log::warn!("dropping packet without destination");
-                        continue;
-                    }
-                };
-                let Some(peer_idx) = state.allowed_ips.find(dst).cloned() else {
-                    log::warn!("no peer for destination {dst}");
+        for frame in frames {
+            let dst = match dst_ip(&frame) {
+                Some(dst) => dst,
+                None => {
+                    log::warn!("dropping packet without destination");
                     continue;
-                };
-                let peer = &mut state.peers[peer_idx];
-                let mut buf = vec![0u8; wg_buffer_size(frame.len())];
-                match peer.tunn.encapsulate(&frame, &mut buf) {
-                    TunnResult::WriteToNetwork(packet) => {
-                        datagrams.push((peer.endpoint, packet.to_vec()));
-                    }
-                    TunnResult::Err(err) => {
-                        log::warn!("wireguard encapsulate error: {err:?}");
-                    }
-                    _ => {}
                 }
+            };
+            let Some(peer_idx) = peers.allowed_ips.find(dst).cloned() else {
+                log::warn!("no peer for destination {dst}");
+                continue;
+            };
+            let peer = &mut peers.peers[peer_idx];
+            match peer.tunn.encapsulate(&frame, &mut buf.buf[..]) {
+                TunnResult::WriteToNetwork(packet) => {
+                    let _ = self.inner.outbound_tx.send(Datagram {
+                        endpoint: peer.endpoint,
+                        data: Bytes::copy_from_slice(packet),
+                    });
+                }
+                TunnResult::Err(err) => {
+                    log::warn!("wireguard encapsulate error: {err:?}");
+                }
+                _ => {}
             }
-            datagrams
-        };
-
-        for (endpoint, packet) in datagrams {
-            self.send_datagram(endpoint, packet).await?;
         }
-
-        Ok(())
     }
 
-    async fn handle_incoming(&self, src: SocketAddr, data: &[u8]) -> anyhow::Result<()> {
-        let datagrams = {
-            let mut state = self.inner.state.lock().await;
-            let mut datagrams = Vec::new();
-            let mut inbound = Vec::new();
+    /// Handle incoming UDP packet from WireGuard peer
+    fn handle_incoming(&self, src: SocketAddr, data: &[u8]) -> anyhow::Result<()> {
+        let mut buf = self.inner.buffer_pool.get_small();
+        let mut inbound_packets = Vec::new();
 
-            let mut out_buf = vec![0u8; wg_buffer_size(state.mtu)];
-            if let Some(peer_idx) = state.peer_by_endpoint.get(&src).cloned() {
-                let peer = &mut state.peers[peer_idx];
-                process_datagram(peer, src.ip(), data, &mut out_buf, &mut datagrams, &mut inbound);
+        {
+            let mut peers = self.inner.peers.write();
+            if let Some(peer_idx) = peers.peer_by_endpoint.get(&src).cloned() {
+                let peer = &mut peers.peers[peer_idx];
+                process_datagram(peer, src.ip(), data, &mut buf.buf[..], &self.inner.outbound_tx, &mut inbound_packets);
             } else {
-                for peer in &mut state.peers {
-                    let handled = process_datagram(peer, src.ip(), data, &mut out_buf, &mut datagrams, &mut inbound);
+                for peer in &mut peers.peers {
+                    let handled = process_datagram(peer, src.ip(), data, &mut buf.buf[..], &self.inner.outbound_tx, &mut inbound_packets);
                     if handled {
                         break;
                     }
                 }
             }
+        }
 
-            for packet in inbound.drain(..) {
-                state.netstack.push_inbound(packet);
-            }
-
-            datagrams
-        };
-
-        if !datagrams.is_empty() {
-            for (endpoint, packet) in datagrams {
-                self.send_datagram(endpoint, packet).await?;
+        // Push inbound packets to netstack (separate lock)
+        if !inbound_packets.is_empty() {
+            let mut netstack = self.inner.netstack.lock();
+            for packet in inbound_packets {
+                netstack.push_inbound(packet);
             }
         }
 
         self.inner.notify.notify_waiters();
-        Ok(())
-    }
-
-    async fn send_datagram(&self, endpoint: SocketAddr, payload: Vec<u8>) -> anyhow::Result<()> {
-        let udp = {
-            let state = self.inner.state.lock().await;
-            state.udp.clone()
-        };
-        udp.send_to(&payload, endpoint)
-            .await
-            .context("udp send")?;
         Ok(())
     }
 }
@@ -660,27 +632,25 @@ impl WgTcpConnection {
     pub async fn read(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
         let handle = match *self.handle.lock().unwrap() {
             Some(h) => h,
-            None => return Ok(0), // Connection already closed
+            None => return Ok(0),
         };
         loop {
-            let mut state = self.runtime.inner.state.lock().await;
-            let socket = state
-                .netstack
-                .sockets
-                .get_mut::<tcp::Socket>(handle);
-            if socket.can_recv() {
-                let size = socket
-                    .recv_slice(buf)
-                    .map_err(|e| anyhow::anyhow!("tcp recv error: {e:?}"))?;
-                if size == 0 {
-                    socket.close();
+            {
+                let mut netstack = self.runtime.inner.netstack.lock();
+                let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
+                if socket.can_recv() {
+                    let size = socket
+                        .recv_slice(buf)
+                        .map_err(|e| anyhow::anyhow!("tcp recv error: {e:?}"))?;
+                    if size == 0 {
+                        socket.close();
+                    }
+                    return Ok(size);
                 }
-                return Ok(size);
+                if socket.state() == tcp::State::Closed {
+                    return Ok(0);
+                }
             }
-            if socket.state() == tcp::State::Closed {
-                return Ok(0);
-            }
-            drop(state);
             self.runtime.inner.notify.notified().await;
         }
     }
@@ -692,21 +662,19 @@ impl WgTcpConnection {
         };
         let mut offset = 0;
         while offset < buf.len() {
-            let mut state = self.runtime.inner.state.lock().await;
-            let socket = state
-                .netstack
-                .sockets
-                .get_mut::<tcp::Socket>(handle);
-            if socket.can_send() {
-                let written = socket
-                    .send_slice(&buf[offset..])
-                    .map_err(|e| anyhow::anyhow!("tcp send error: {e:?}"))?;
-                offset += written;
-                self.runtime.inner.notify.notify_waiters();
-            } else {
-                drop(state);
-                self.runtime.inner.notify.notified().await;
+            {
+                let mut netstack = self.runtime.inner.netstack.lock();
+                let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
+                if socket.can_send() {
+                    let written = socket
+                        .send_slice(&buf[offset..])
+                        .map_err(|e| anyhow::anyhow!("tcp send error: {e:?}"))?;
+                    offset += written;
+                    self.runtime.inner.notify.notify_waiters();
+                    continue;
+                }
             }
+            self.runtime.inner.notify.notified().await;
         }
         Ok(offset)
     }
@@ -714,17 +682,14 @@ impl WgTcpConnection {
     pub async fn close(&mut self) {
         let handle = match self.handle.lock().unwrap().take() {
             Some(h) => h,
-            None => return, // Already closed
+            None => return,
         };
-        let mut state = self.runtime.inner.state.lock().await;
+        let mut netstack = self.runtime.inner.netstack.lock();
         {
-            let socket = state
-                .netstack
-                .sockets
-                .get_mut::<tcp::Socket>(handle);
+            let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
             socket.close();
         }
-        state.netstack.sockets.remove(handle);
+        netstack.sockets.remove(handle);
         self.runtime.inner.notify.notify_waiters();
     }
 
@@ -735,32 +700,26 @@ impl WgTcpConnection {
         };
         let deadline = tokio::time::Instant::now() + TCP_CONNECT_TIMEOUT;
         loop {
-            let mut state = self.runtime.inner.state.lock().await;
-            let socket = state
-                .netstack
-                .sockets
-                .get_mut::<tcp::Socket>(handle);
-            match socket.state() {
-                tcp::State::Established => return Ok(()),
-                tcp::State::Closed => {
-                    *self.handle.lock().unwrap() = None; // Mark as closed
-                    state.netstack.sockets.remove(handle);
-                    anyhow::bail!("tcp connection failed to establish");
+            {
+                let mut netstack = self.runtime.inner.netstack.lock();
+                let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
+                match socket.state() {
+                    tcp::State::Established => return Ok(()),
+                    tcp::State::Closed => {
+                        *self.handle.lock().unwrap() = None;
+                        netstack.sockets.remove(handle);
+                        anyhow::bail!("tcp connection failed to establish");
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-            drop(state);
 
             if tokio::time::Instant::now() >= deadline {
-                // Clean up the socket on timeout
-                let mut state = self.runtime.inner.state.lock().await;
-                let socket = state
-                    .netstack
-                    .sockets
-                    .get_mut::<tcp::Socket>(handle);
+                let mut netstack = self.runtime.inner.netstack.lock();
+                let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
                 socket.abort();
-                state.netstack.sockets.remove(handle);
-                *self.handle.lock().unwrap() = None; // Mark as closed
+                netstack.sockets.remove(handle);
+                *self.handle.lock().unwrap() = None;
                 anyhow::bail!("tcp connection timed out");
             }
 
@@ -774,6 +733,84 @@ impl WgTcpListener {
         self.runtime.accept(self.port).await
     }
 }
+
+// ============ Event-driven outbound sender ============
+
+/// Event-driven outbound sender loop with Linux sendmmsg support
+async fn outbound_sender_loop(udp: Arc<UdpSocket>, mut rx: mpsc::UnboundedReceiver<Datagram>) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = udp.as_raw_fd();
+        let mut batch = Vec::with_capacity(64);
+
+        loop {
+            batch.clear();
+
+            // Wait for at least one datagram
+            match rx.recv().await {
+                Some(dg) => batch.push(dg),
+                None => break,
+            }
+
+            // Collect more without blocking (up to 64)
+            while batch.len() < 64 {
+                match rx.try_recv() {
+                    Ok(dg) => batch.push(dg),
+                    Err(_) => break,
+                }
+            }
+
+            if batch.len() == 1 {
+                let dg = &batch[0];
+                if let Err(e) = udp.send_to(&dg.data, dg.endpoint).await {
+                    log::error!("udp send error: {e}");
+                }
+            } else {
+                // Batch send using sendmmsg
+                if let Err(e) = send_batch_linux(fd, &batch) {
+                    log::error!("sendmmsg error: {e}");
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        while let Some(dg) = rx.recv().await {
+            if let Err(e) = udp.send_to(&dg.data, dg.endpoint).await {
+                log::error!("udp send error: {e}");
+            }
+        }
+    }
+}
+
+/// Linux sendmmsg batch send implementation
+#[cfg(target_os = "linux")]
+fn send_batch_linux(fd: std::os::fd::RawFd, batch: &[Datagram]) -> anyhow::Result<()> {
+    use nix::sys::socket::{sendmmsg, MsgFlags, MultiHeaders, SockaddrStorage};
+    use std::io::IoSlice;
+
+    let mut iovecs: Vec<[IoSlice<'_>; 1]> = Vec::with_capacity(batch.len());
+    let mut addrs: Vec<Option<SockaddrStorage>> = Vec::with_capacity(batch.len());
+
+    // Prepare addresses and iovecs
+    for dg in batch {
+        let addr: SockaddrStorage = dg.endpoint.into();
+        addrs.push(Some(addr));
+        iovecs.push([IoSlice::new(&dg.data)]);
+    }
+
+    // nix 0.30 sendmmsg requires MultiHeaders preallocated buffer
+    let mut data: MultiHeaders<SockaddrStorage> =
+        MultiHeaders::preallocate(batch.len(), None);
+    let cmsgs: Vec<nix::sys::socket::ControlMessage<'_>> = vec![];
+
+    sendmmsg(fd, &mut data, &iovecs, &addrs, &cmsgs, MsgFlags::empty())?;
+    Ok(())
+}
+
+// ============ Helper functions ============
 
 fn bind_udp_socket(listen_port: Option<u16>) -> anyhow::Result<UdpSocket> {
     let port = listen_port.unwrap_or(0);
@@ -798,27 +835,12 @@ fn build_tunn(device: &DeviceConfig, peer: &PeerConfig) -> anyhow::Result<Tunn> 
         Some(peer.keepalive)
     };
     let index: u32 = rand::random();
-    Tunn::new(
-        private_key,
-        peer_public,
-        preshared,
-        keepalive,
-        index,
-        None,
-    )
-    .map_err(|err| anyhow::anyhow!(err))
+    Tunn::new(private_key, peer_public, preshared, keepalive, index, None)
+        .map_err(|err| anyhow::anyhow!(err))
 }
 
 fn encode_key(key: &[u8; 32]) -> String {
     BASE64_STD.encode(key)
-}
-
-fn wg_buffer_size(payload_len: usize) -> usize {
-    let mut size = payload_len + 32;
-    if size < 148 {
-        size = 148;
-    }
-    size
 }
 
 fn to_ip_address(addr: IpAddr) -> IpAddress {
@@ -874,12 +896,7 @@ fn matches_echo_reply(
                 Err(_) => return false,
             };
             matches!(
-                Icmpv6Repr::parse(
-                    &src,
-                    &dst,
-                    &packet,
-                    &ChecksumCapabilities::ignored(),
-                ),
+                Icmpv6Repr::parse(&src, &dst, &packet, &ChecksumCapabilities::ignored()),
                 Ok(Icmpv6Repr::EchoReply {
                     ident: reply_ident,
                     seq_no: reply_seq,
@@ -895,7 +912,7 @@ fn process_datagram(
     src_ip: IpAddr,
     data: &[u8],
     out_buf: &mut [u8],
-    datagrams: &mut Vec<(SocketAddr, Vec<u8>)>,
+    outbound_tx: &mpsc::UnboundedSender<Datagram>,
     inbound: &mut Vec<Vec<u8>>,
 ) -> bool {
     let mut handled = false;
@@ -905,7 +922,10 @@ fn process_datagram(
         match result {
             TunnResult::WriteToNetwork(packet) => {
                 log::debug!("peer{} - Received handshake response", peer_id);
-                datagrams.push((peer.endpoint, packet.to_vec()));
+                let _ = outbound_tx.send(Datagram {
+                    endpoint: peer.endpoint,
+                    data: Bytes::copy_from_slice(packet),
+                });
                 handled = true;
                 result = peer.tunn.decapsulate(Some(src_ip), &[], out_buf);
             }
@@ -922,8 +942,7 @@ fn process_datagram(
                 break;
             }
             TunnResult::Done => {
-                // Could be a keepalive packet (empty data after decryption)
-                if data.len() > 0 && data.len() < 100 {
+                if !data.is_empty() && data.len() < 100 {
                     log::debug!("peer{} - Receiving keepalive packet", peer_id);
                 }
                 handled = true;

@@ -1,4 +1,5 @@
 mod app;
+mod buffer;
 mod config;
 mod dns;
 mod health;

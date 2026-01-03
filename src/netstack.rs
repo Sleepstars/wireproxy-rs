@@ -4,8 +4,11 @@ use std::time::Instant as StdInstant;
 use rand::RngCore;
 use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address};
+use smoltcp::wire::{
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Address,
+};
 
 pub(crate) struct Netstack {
     pub(crate) device: IpDevice,
@@ -100,6 +103,17 @@ impl Netstack {
         T: smoltcp::socket::AnySocket<'static>,
     {
         self.sockets.add(socket)
+    }
+
+    /// Connect a TCP socket - handles the borrow checker issue with iface.context()
+    pub(crate) fn tcp_connect(
+        &mut self,
+        handle: SocketHandle,
+        remote: IpEndpoint,
+        local: IpListenEndpoint,
+    ) -> Result<(), smoltcp::socket::tcp::ConnectError> {
+        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        socket.connect(self.iface.context(), remote, local)
     }
 }
 

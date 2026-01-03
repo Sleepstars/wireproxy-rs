@@ -7,6 +7,7 @@ use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 
 use crate::wg::WireguardRuntime;
 
+/// Resolve hostname to IP address with parallel A/AAAA queries
 pub async fn resolve(runtime: &WireguardRuntime, name: &str) -> anyhow::Result<IpAddr> {
     if runtime.system_dns() {
         let mut addrs = tokio::net::lookup_host((name, 0))
@@ -19,27 +20,43 @@ pub async fn resolve(runtime: &WireguardRuntime, name: &str) -> anyhow::Result<I
     }
 
     let servers = runtime.dns_servers();
-    let mut last_err: Option<anyhow::Error> = None;
+    
     for server in servers {
-        match query_dns(runtime, server, name, RecordType::A).await {
+        // Query A and AAAA records in parallel
+        match query_parallel(runtime, server, name).await {
             Ok(ip) => return Ok(ip),
-            Err(err) => {
-                if last_err.is_none() {
-                    last_err = Some(err);
-                }
-            }
-        }
-        match query_dns(runtime, server, name, RecordType::AAAA).await {
-            Ok(ip) => return Ok(ip),
-            Err(err) => {
-                if last_err.is_none() {
-                    last_err = Some(err);
-                }
+            Err(e) => {
+                log::debug!("dns query to {server} failed: {e}");
+                continue;
             }
         }
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("dns resolution failed")))
+    anyhow::bail!("dns resolution failed for {name}")
+}
+
+/// Query A and AAAA records in parallel, return first successful result
+async fn query_parallel(
+    runtime: &WireguardRuntime,
+    server: IpAddr,
+    name: &str,
+) -> anyhow::Result<IpAddr> {
+    // Run both queries in parallel using join
+    let (a_result, aaaa_result) = tokio::join!(
+        query_dns(runtime, server, name, RecordType::A),
+        query_dns(runtime, server, name, RecordType::AAAA)
+    );
+
+    // Prefer IPv4 if available, otherwise use IPv6
+    if let Ok(ip) = a_result {
+        return Ok(ip);
+    }
+    if let Ok(ip) = aaaa_result {
+        return Ok(ip);
+    }
+
+    // Both failed, return the A query error
+    a_result
 }
 
 async fn query_dns(
@@ -55,8 +72,8 @@ async fn query_dns(
     msg.set_op_code(OpCode::Query);
     msg.set_recursion_desired(true);
 
-    let name = Name::from_ascii(name).context("invalid dns name")?;
-    msg.add_query(Query::query(name, record_type));
+    let dns_name = Name::from_ascii(name).context("invalid dns name")?;
+    msg.add_query(Query::query(dns_name, record_type));
 
     let mut bytes = Vec::with_capacity(512);
     let mut encoder = BinEncoder::new(&mut bytes);
