@@ -1,6 +1,6 @@
 use anyhow::Context;
-use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -127,7 +127,7 @@ async fn read_request(client: &mut TcpStream) -> anyhow::Result<(ParsedRequest, 
             anyhow::bail!("connection closed");
         }
         buf.extend_from_slice(&tmp[..n]);
-        if let Some(_) = find_header_end(&buf) {
+        if find_header_end(&buf).is_some() {
             break;
         }
     }
@@ -154,9 +154,15 @@ async fn read_request(client: &mut TcpStream) -> anyhow::Result<(ParsedRequest, 
         }
     };
 
-    let method = req.method.ok_or_else(|| anyhow::anyhow!("missing method"))?;
-    let raw_uri = req.path.ok_or_else(|| anyhow::anyhow!("missing request uri"))?;
-    let version = req.version.ok_or_else(|| anyhow::anyhow!("missing http version"))?;
+    let method = req
+        .method
+        .ok_or_else(|| anyhow::anyhow!("missing method"))?;
+    let raw_uri = req
+        .path
+        .ok_or_else(|| anyhow::anyhow!("missing request uri"))?;
+    let version = req
+        .version
+        .ok_or_else(|| anyhow::anyhow!("missing http version"))?;
     let (proto, proto_major, proto_minor) = parse_proto(version)?;
 
     let mut host_header = None;
@@ -166,7 +172,7 @@ async fn read_request(client: &mut TcpStream) -> anyhow::Result<(ParsedRequest, 
         if header.name.eq_ignore_ascii_case("Host") {
             host_count += 1;
             if host_header.is_none() {
-                host_header = header_value_bytes(&header)
+                host_header = header_value_bytes(header)
                     .map(|value| String::from_utf8_lossy(value).to_string());
             }
         } else {
@@ -183,7 +189,6 @@ async fn read_request(client: &mut TcpStream) -> anyhow::Result<(ParsedRequest, 
         None => host_header.unwrap_or_default(),
     };
 
-    let mut parsed_headers = parsed_headers;
     fix_pragma_cache_control(&mut parsed_headers);
 
     let request = ParsedRequest {
@@ -346,10 +351,7 @@ fn build_request_bytes(req: &ParsedRequest) -> anyhow::Result<Vec<u8>> {
         .iter()
         .any(|value| has_chunked_encoding(value));
 
-    let should_send_content_length = match content_length {
-        Some(len) if len > 0 => true,
-        _ => false,
-    };
+    let should_send_content_length = matches!(content_length, Some(len) if len > 0);
 
     let should_send_transfer_encoding = !should_send_content_length && has_chunked;
 
@@ -471,10 +473,7 @@ async fn write_response_with(
     proxy_authenticate: bool,
 ) -> anyhow::Result<()> {
     let status_text = status_text(status);
-    let body = format!(
-        "wireproxy: {} {} {}\r\n",
-        req.proto, status, status_text
-    );
+    let body = format!("wireproxy: {} {} {}\r\n", req.proto, status, status_text);
     let mut response = format!(
         "HTTP/{}.{} {:03} {}\r\n",
         req.proto_major, req.proto_minor, status, status_text
@@ -656,5 +655,320 @@ impl std::fmt::Display for AuthError {
             AuthError::LengthRequired => write!(f, "username and password format invalid"),
             AuthError::Unauthorized => write!(f, "username and password not matching"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_request_uri_connect() {
+        let result = parse_request_uri("CONNECT", "example.com:443");
+        assert_eq!(result.host, Some("example.com:443".to_string()));
+        assert_eq!(result.path, "");
+    }
+
+    #[test]
+    fn parse_request_uri_absolute() {
+        let result = parse_request_uri("GET", "http://example.com/path");
+        assert_eq!(result.host, Some("example.com".to_string()));
+        assert_eq!(result.path, "/path");
+    }
+
+    #[test]
+    fn parse_request_uri_absolute_with_port() {
+        let result = parse_request_uri("GET", "http://example.com:8080/path");
+        assert_eq!(result.host, Some("example.com:8080".to_string()));
+        assert_eq!(result.path, "/path");
+    }
+
+    #[test]
+    fn parse_request_uri_relative() {
+        let result = parse_request_uri("GET", "/path/to/resource");
+        assert_eq!(result.host, None);
+        assert_eq!(result.path, "/path/to/resource");
+    }
+
+    #[test]
+    fn parse_request_uri_empty_becomes_slash() {
+        let result = parse_request_uri("GET", "");
+        assert_eq!(result.path, "/");
+    }
+
+    #[test]
+    fn parse_absolute_uri_with_query() {
+        let result = parse_absolute_uri("http://example.com?query=1");
+        assert!(result.is_some());
+        let parsed = result.unwrap();
+        assert_eq!(parsed.host, Some("example.com".to_string()));
+        assert_eq!(parsed.path, "/?query=1");
+    }
+
+    #[test]
+    fn parse_absolute_uri_strips_fragment() {
+        let result = parse_absolute_uri("http://example.com/path#fragment");
+        assert!(result.is_some());
+        let parsed = result.unwrap();
+        assert_eq!(parsed.path, "/path");
+    }
+
+    #[test]
+    fn default_port_addr_with_port() {
+        let result = default_port_addr("example.com:8080", 443);
+        assert_eq!(result, "example.com:8080");
+    }
+
+    #[test]
+    fn default_port_addr_without_port() {
+        let result = default_port_addr("example.com", 443);
+        assert_eq!(result, "example.com:443");
+    }
+
+    #[test]
+    fn split_host_port_ipv4() {
+        let result = split_host_port_required("192.168.1.1:8080");
+        assert!(result.is_ok());
+        let (host, port) = result.unwrap();
+        assert_eq!(host, "192.168.1.1");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn split_host_port_ipv6() {
+        let result = split_host_port_required("[::1]:8080");
+        assert!(result.is_ok());
+        let (host, port) = result.unwrap();
+        assert_eq!(host, "::1");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn split_host_port_domain() {
+        let result = split_host_port_required("example.com:443");
+        assert!(result.is_ok());
+        let (host, port) = result.unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn split_host_port_missing_port() {
+        let result = split_host_port_required("example.com");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn find_header_end_found() {
+        let buf = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\nbody";
+        let result = find_header_end(buf);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn find_header_end_not_found() {
+        let buf = b"GET / HTTP/1.1\r\nHost: example.com\r\n";
+        let result = find_header_end(buf);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn canonical_header_name_simple() {
+        assert_eq!(canonical_header_name("content-type"), "Content-Type");
+        assert_eq!(canonical_header_name("CONTENT-TYPE"), "Content-Type");
+        assert_eq!(canonical_header_name("Content-Type"), "Content-Type");
+    }
+
+    #[test]
+    fn canonical_header_name_multi_dash() {
+        assert_eq!(canonical_header_name("x-custom-header"), "X-Custom-Header");
+    }
+
+    fn make_header(name: &str, value: &[u8]) -> OwnedHeader {
+        OwnedHeader {
+            name: name.to_string(),
+            value: value.to_vec(),
+        }
+    }
+
+    #[test]
+    fn header_value_found() {
+        let headers = vec![make_header("Content-Type", b"text/html")];
+        let result = header_value(&headers, "Content-Type");
+        assert_eq!(result, Some("text/html"));
+    }
+
+    #[test]
+    fn header_value_case_insensitive() {
+        let headers = vec![make_header("Content-Type", b"text/html")];
+        let result = header_value(&headers, "content-type");
+        assert_eq!(result, Some("text/html"));
+    }
+
+    #[test]
+    fn header_value_not_found() {
+        let headers = vec![make_header("Content-Type", b"text/html")];
+        let result = header_value(&headers, "Accept");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn header_values_multiple() {
+        let headers = vec![
+            make_header("Accept", b"text/html"),
+            make_header("Accept", b"application/json"),
+        ];
+        let result = header_values(&headers, "Accept");
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn connection_has_close_true() {
+        let headers = vec![make_header("Connection", b"close")];
+        assert!(connection_has_close(&headers));
+    }
+
+    #[test]
+    fn connection_has_close_false() {
+        let headers = vec![make_header("Connection", b"keep-alive")];
+        assert!(!connection_has_close(&headers));
+    }
+
+    #[test]
+    fn connection_has_token_in_list() {
+        let headers = vec![make_header("Connection", b"keep-alive, close")];
+        assert!(connection_has_token(&headers, "close"));
+        assert!(connection_has_token(&headers, "keep-alive"));
+    }
+
+    #[test]
+    fn should_close_http10_no_keepalive() {
+        let headers: Vec<OwnedHeader> = vec![];
+        assert!(should_close(1, 0, &headers));
+    }
+
+    #[test]
+    fn should_close_http11_default() {
+        let headers: Vec<OwnedHeader> = vec![];
+        assert!(!should_close(1, 1, &headers));
+    }
+
+    #[test]
+    fn should_close_http11_with_close() {
+        let headers = vec![make_header("Connection", b"close")];
+        assert!(should_close(1, 1, &headers));
+    }
+
+    #[test]
+    fn content_length_present() {
+        let headers = vec![make_header("Content-Length", b"100")];
+        let result = content_length(&headers).unwrap();
+        assert_eq!(result, Some(100));
+    }
+
+    #[test]
+    fn content_length_absent() {
+        let headers: Vec<OwnedHeader> = vec![];
+        let result = content_length(&headers).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn content_length_invalid() {
+        let headers = vec![make_header("Content-Length", b"not-a-number")];
+        let result = content_length(&headers);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn content_length_conflicting() {
+        let headers = vec![
+            make_header("Content-Length", b"100"),
+            make_header("Content-Length", b"200"),
+        ];
+        let result = content_length(&headers);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn has_chunked_encoding_true() {
+        assert!(has_chunked_encoding("chunked"));
+        assert!(has_chunked_encoding("gzip, chunked"));
+        assert!(has_chunked_encoding("chunked, gzip"));
+    }
+
+    #[test]
+    fn has_chunked_encoding_false() {
+        assert!(!has_chunked_encoding("gzip"));
+        assert!(!has_chunked_encoding(""));
+    }
+
+    #[test]
+    fn sanitize_header_value_normal() {
+        let result = sanitize_header_value("Mozilla/5.0");
+        assert_eq!(result, "Mozilla/5.0");
+    }
+
+    #[test]
+    fn sanitize_header_value_with_newlines() {
+        let result = sanitize_header_value("value\r\ninjected");
+        assert_eq!(result, "value  injected");
+    }
+
+    #[test]
+    fn constant_time_eq_equal() {
+        assert!(constant_time_eq(b"password", b"password"));
+    }
+
+    #[test]
+    fn constant_time_eq_not_equal() {
+        assert!(!constant_time_eq(b"password", b"passwor"));
+        assert!(!constant_time_eq(b"password", b"PASSWORD"));
+    }
+
+    #[test]
+    fn constant_time_eq_different_length() {
+        assert!(!constant_time_eq(b"short", b"longer"));
+    }
+
+    #[test]
+    fn auth_error_codes() {
+        assert_eq!(AuthError::ProxyAuthRequired.code(), 407);
+        assert_eq!(AuthError::NotAcceptable.code(), 406);
+        assert_eq!(AuthError::LengthRequired.code(), 411);
+        assert_eq!(AuthError::Unauthorized.code(), 401);
+    }
+
+    #[test]
+    fn auth_error_needs_proxy_auth() {
+        assert!(AuthError::ProxyAuthRequired.needs_proxy_auth());
+        assert!(!AuthError::Unauthorized.needs_proxy_auth());
+    }
+
+    #[test]
+    fn status_text_known() {
+        assert_eq!(status_text(401), "Unauthorized");
+        assert_eq!(status_text(407), "Proxy Authentication Required");
+    }
+
+    #[test]
+    fn status_text_unknown() {
+        assert_eq!(status_text(999), "");
+    }
+
+    #[test]
+    fn parse_proto_http10() {
+        let (proto, major, minor) = parse_proto(0).unwrap();
+        assert_eq!(proto, "HTTP/1.0");
+        assert_eq!(major, 1);
+        assert_eq!(minor, 0);
+    }
+
+    #[test]
+    fn parse_proto_http11() {
+        let (proto, major, minor) = parse_proto(1).unwrap();
+        assert_eq!(proto, "HTTP/1.1");
+        assert_eq!(major, 1);
+        assert_eq!(minor, 1);
     }
 }

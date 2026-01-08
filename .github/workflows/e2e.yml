@@ -1,0 +1,72 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Install WireGuard tools
+        run: sudo apt-get update && sudo apt-get install -y wireguard-tools
+
+      - name: Generate WireGuard keys
+        run: |
+          wg genkey | tee /tmp/server_private | wg pubkey > /tmp/server_public
+          wg genkey | tee /tmp/client_private | wg pubkey > /tmp/client_public
+
+      - name: Setup WireGuard server
+        run: |
+          sudo ip link add wg0 type wireguard
+          sudo ip addr add 10.200.200.1/24 dev wg0
+          sudo wg set wg0 \
+            private-key /tmp/server_private \
+            listen-port 51820 \
+            peer $(cat /tmp/client_public) allowed-ips 10.200.200.2/32
+          sudo ip link set wg0 up
+
+      - name: Start echo server on WireGuard interface
+        run: |
+          sudo apt-get install -y netcat-openbsd
+          # Start a simple TCP echo server on the WireGuard server IP
+          nohup bash -c 'while true; do nc -l -p 8888 -q 1 -e cat 2>/dev/null || nc -l 10.200.200.1 8888 -c cat; done' &
+          sleep 1
+
+      - name: Create test config
+        run: |
+          cat > /tmp/test.conf << EOF
+          [Interface]
+          Address = 10.200.200.2/32
+          PrivateKey = $(cat /tmp/client_private)
+
+          [Peer]
+          PublicKey = $(cat /tmp/server_public)
+          Endpoint = 127.0.0.1:51820
+          AllowedIPs = 10.200.200.0/24
+
+          [Socks5]
+          BindAddress = 127.0.0.1:1080
+
+          [http]
+          BindAddress = 127.0.0.1:8080
+          EOF
+
+      - name: Build wireproxy
+        run: cargo build --release
+
+      - name: Run E2E tests
+        run: |
+          WIREPROXY_TEST_CONFIG=/tmp/test.conf cargo test --test e2e -- --ignored
+        timeout-minutes: 5

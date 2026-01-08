@@ -7,7 +7,10 @@ pub const TCP_BUFFER_SIZE: usize = 32 * 1024;
 
 /// A pool of reusable buffers to reduce allocations
 pub struct BufferPool {
+    // We intentionally use Box here to avoid stack overflow when moving large arrays
+    #[allow(clippy::vec_box)]
     small_buffers: Mutex<Vec<Box<[u8; WG_BUFFER_SIZE]>>>,
+    #[allow(clippy::vec_box)]
     large_buffers: Mutex<Vec<Box<[u8; TCP_BUFFER_SIZE]>>>,
     #[allow(dead_code)]
     max_small: usize,

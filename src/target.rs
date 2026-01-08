@@ -5,7 +5,11 @@ use anyhow::Context;
 use crate::dns;
 use crate::wg::WireguardRuntime;
 
-pub async fn resolve_target(runtime: &WireguardRuntime, target: &str, default_port: u16) -> anyhow::Result<SocketAddr> {
+pub async fn resolve_target(
+    runtime: &WireguardRuntime,
+    target: &str,
+    default_port: u16,
+) -> anyhow::Result<SocketAddr> {
     if let Ok(addr) = target.parse::<SocketAddr>() {
         return Ok(addr);
     }

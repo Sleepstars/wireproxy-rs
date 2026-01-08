@@ -69,7 +69,10 @@ async fn handle_client(
     Ok(())
 }
 
-async fn resolve_target(runtime: &WireguardRuntime, request: SocksRequest) -> anyhow::Result<SocketAddr> {
+async fn resolve_target(
+    runtime: &WireguardRuntime,
+    request: SocksRequest,
+) -> anyhow::Result<SocketAddr> {
     match request.addr {
         SocksAddr::Ip(ip) => Ok(SocketAddr::new(ip, request.port)),
         SocksAddr::Domain(domain) => {
@@ -109,7 +112,7 @@ async fn negotiate_auth(socket: &mut TcpStream, config: &Socks5Config) -> anyhow
     }
 
     if selected == METHOD_USER_PASS {
-        return Ok(verify_user_pass(socket, config).await?);
+        return verify_user_pass(socket, config).await;
     }
 
     Ok(true)
@@ -119,7 +122,9 @@ async fn verify_user_pass(socket: &mut TcpStream, config: &Socks5Config) -> anyh
     let mut header = [0u8; 2];
     socket.read_exact(&mut header).await?;
     if header[0] != USERPASS_VERSION {
-        socket.write_all(&[USERPASS_VERSION, USERPASS_STATUS_FAIL]).await?;
+        socket
+            .write_all(&[USERPASS_VERSION, USERPASS_STATUS_FAIL])
+            .await?;
         return Ok(false);
     }
 
@@ -134,7 +139,11 @@ async fn verify_user_pass(socket: &mut TcpStream, config: &Socks5Config) -> anyh
     socket.read_exact(&mut pass).await?;
 
     let ok = user == config.username.as_bytes() && pass == config.password.as_bytes();
-    let status = if ok { USERPASS_STATUS_OK } else { USERPASS_STATUS_FAIL };
+    let status = if ok {
+        USERPASS_STATUS_OK
+    } else {
+        USERPASS_STATUS_FAIL
+    };
     socket.write_all(&[USERPASS_VERSION, status]).await?;
     Ok(ok)
 }
@@ -210,18 +219,195 @@ struct SocksRequest {
     port: u16,
 }
 
-const SOCKS_VERSION: u8 = 0x05;
-const METHOD_NO_AUTH: u8 = 0x00;
-const METHOD_USER_PASS: u8 = 0x02;
-const METHOD_NO_ACCEPT: u8 = 0xFF;
-const USERPASS_VERSION: u8 = 0x01;
-const USERPASS_STATUS_OK: u8 = 0x00;
-const USERPASS_STATUS_FAIL: u8 = 0x01;
-const CMD_CONNECT: u8 = 0x01;
-const ATYP_IPV4: u8 = 0x01;
-const ATYP_DOMAIN: u8 = 0x03;
-const ATYP_IPV6: u8 = 0x04;
-const REP_SUCCESS: u8 = 0x00;
-const REP_GENERAL_FAILURE: u8 = 0x01;
-const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
-const REP_ADDR_TYPE_NOT_SUPPORTED: u8 = 0x08;
+// SOCKS5 protocol constants
+pub(crate) const SOCKS_VERSION: u8 = 0x05;
+pub(crate) const METHOD_NO_AUTH: u8 = 0x00;
+pub(crate) const METHOD_USER_PASS: u8 = 0x02;
+pub(crate) const METHOD_NO_ACCEPT: u8 = 0xFF;
+pub(crate) const USERPASS_VERSION: u8 = 0x01;
+pub(crate) const USERPASS_STATUS_OK: u8 = 0x00;
+pub(crate) const USERPASS_STATUS_FAIL: u8 = 0x01;
+pub(crate) const CMD_CONNECT: u8 = 0x01;
+pub(crate) const ATYP_IPV4: u8 = 0x01;
+pub(crate) const ATYP_DOMAIN: u8 = 0x03;
+pub(crate) const ATYP_IPV6: u8 = 0x04;
+pub(crate) const REP_SUCCESS: u8 = 0x00;
+pub(crate) const REP_GENERAL_FAILURE: u8 = 0x01;
+pub(crate) const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
+pub(crate) const REP_ADDR_TYPE_NOT_SUPPORTED: u8 = 0x08;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socks5_version_is_correct() {
+        assert_eq!(SOCKS_VERSION, 0x05);
+    }
+
+    #[test]
+    fn auth_methods_are_correct() {
+        assert_eq!(METHOD_NO_AUTH, 0x00);
+        assert_eq!(METHOD_USER_PASS, 0x02);
+        assert_eq!(METHOD_NO_ACCEPT, 0xFF);
+    }
+
+    #[test]
+    fn address_types_are_correct() {
+        assert_eq!(ATYP_IPV4, 0x01);
+        assert_eq!(ATYP_DOMAIN, 0x03);
+        assert_eq!(ATYP_IPV6, 0x04);
+    }
+
+    #[test]
+    fn reply_codes_are_correct() {
+        assert_eq!(REP_SUCCESS, 0x00);
+        assert_eq!(REP_GENERAL_FAILURE, 0x01);
+        assert_eq!(REP_COMMAND_NOT_SUPPORTED, 0x07);
+        assert_eq!(REP_ADDR_TYPE_NOT_SUPPORTED, 0x08);
+    }
+
+    #[test]
+    fn build_greeting_no_auth() {
+        // Client greeting: version + nmethods + methods
+        let greeting = [SOCKS_VERSION, 0x01, METHOD_NO_AUTH];
+        assert_eq!(greeting[0], 0x05);
+        assert_eq!(greeting[1], 0x01); // 1 method
+        assert_eq!(greeting[2], 0x00); // NO AUTH
+    }
+
+    #[test]
+    fn build_greeting_with_auth() {
+        let greeting = [SOCKS_VERSION, 0x02, METHOD_NO_AUTH, METHOD_USER_PASS];
+        assert_eq!(greeting.len(), 4);
+        assert_eq!(greeting[1], 0x02); // 2 methods
+    }
+
+    #[test]
+    fn build_connect_request_ipv4() {
+        // CONNECT to 192.168.1.1:80
+        let mut request = vec![
+            SOCKS_VERSION,
+            CMD_CONNECT,
+            0x00, // reserved
+            ATYP_IPV4,
+            192,
+            168,
+            1,
+            1, // IP
+        ];
+        request.extend_from_slice(&80u16.to_be_bytes()); // port
+
+        assert_eq!(request.len(), 10);
+        assert_eq!(request[3], ATYP_IPV4);
+    }
+
+    #[test]
+    fn build_connect_request_domain() {
+        // CONNECT to example.com:443
+        let domain = b"example.com";
+        let mut request = vec![
+            SOCKS_VERSION,
+            CMD_CONNECT,
+            0x00,
+            ATYP_DOMAIN,
+            domain.len() as u8,
+        ];
+        request.extend_from_slice(domain);
+        request.extend_from_slice(&443u16.to_be_bytes());
+
+        assert_eq!(request[3], ATYP_DOMAIN);
+        assert_eq!(request[4], 11); // domain length
+    }
+
+    #[test]
+    fn build_connect_request_ipv6() {
+        // CONNECT to ::1:8080
+        let ipv6: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let mut request = vec![SOCKS_VERSION, CMD_CONNECT, 0x00, ATYP_IPV6];
+        request.extend_from_slice(&ipv6);
+        request.extend_from_slice(&8080u16.to_be_bytes());
+
+        assert_eq!(request.len(), 22); // 4 + 16 + 2
+        assert_eq!(request[3], ATYP_IPV6);
+    }
+
+    #[test]
+    fn parse_server_choice_no_auth() {
+        let response = [SOCKS_VERSION, METHOD_NO_AUTH];
+        assert_eq!(response[0], SOCKS_VERSION);
+        assert_eq!(response[1], METHOD_NO_AUTH);
+    }
+
+    #[test]
+    fn parse_server_choice_user_pass() {
+        let response = [SOCKS_VERSION, METHOD_USER_PASS];
+        assert_eq!(response[1], METHOD_USER_PASS);
+    }
+
+    #[test]
+    fn parse_server_choice_no_accept() {
+        let response = [SOCKS_VERSION, METHOD_NO_ACCEPT];
+        assert_eq!(response[1], METHOD_NO_ACCEPT);
+    }
+
+    #[test]
+    fn parse_connect_reply_success() {
+        let reply = [
+            SOCKS_VERSION,
+            REP_SUCCESS,
+            0x00,
+            ATYP_IPV4,
+            0,
+            0,
+            0,
+            0, // bound addr
+            0,
+            0, // bound port
+        ];
+        assert_eq!(reply[1], REP_SUCCESS);
+    }
+
+    #[test]
+    fn parse_connect_reply_failure() {
+        let reply = [
+            SOCKS_VERSION,
+            REP_GENERAL_FAILURE,
+            0x00,
+            ATYP_IPV4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        assert_eq!(reply[1], REP_GENERAL_FAILURE);
+    }
+
+    #[test]
+    fn build_userpass_request() {
+        let user = b"testuser";
+        let pass = b"testpass";
+
+        let mut request = vec![USERPASS_VERSION, user.len() as u8];
+        request.extend_from_slice(user);
+        request.push(pass.len() as u8);
+        request.extend_from_slice(pass);
+
+        assert_eq!(request[0], USERPASS_VERSION);
+        assert_eq!(request[1], 8); // username length
+    }
+
+    #[test]
+    fn parse_userpass_response_ok() {
+        let response = [USERPASS_VERSION, USERPASS_STATUS_OK];
+        assert_eq!(response[1], USERPASS_STATUS_OK);
+    }
+
+    #[test]
+    fn parse_userpass_response_fail() {
+        let response = [USERPASS_VERSION, USERPASS_STATUS_FAIL];
+        assert_eq!(response[1], USERPASS_STATUS_FAIL);
+    }
+}

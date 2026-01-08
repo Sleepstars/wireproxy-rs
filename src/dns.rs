@@ -20,7 +20,7 @@ pub async fn resolve(runtime: &WireguardRuntime, name: &str) -> anyhow::Result<I
     }
 
     let servers = runtime.dns_servers();
-    
+
     for server in servers {
         // Query A and AAAA records in parallel
         match query_parallel(runtime, server, name).await {

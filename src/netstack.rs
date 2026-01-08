@@ -82,7 +82,7 @@ impl Netstack {
     pub(crate) fn poll_delay(&mut self) -> Option<std::time::Duration> {
         self.iface
             .poll_delay(self.now(), &self.sockets)
-            .map(|delay| std::time::Duration::from_millis(delay.total_millis() as u64))
+            .map(|delay| std::time::Duration::from_millis(delay.total_millis()))
     }
 
     pub(crate) fn push_inbound(&mut self, packet: Vec<u8>) {
@@ -119,8 +119,8 @@ impl Netstack {
 
 fn to_ip_address(addr: std::net::IpAddr) -> IpAddress {
     match addr {
-        std::net::IpAddr::V4(v4) => IpAddress::Ipv4(Ipv4Address::from(v4)),
-        std::net::IpAddr::V6(v6) => IpAddress::Ipv6(Ipv6Address::from(v6)),
+        std::net::IpAddr::V4(v4) => IpAddress::Ipv4(v4),
+        std::net::IpAddr::V6(v6) => IpAddress::Ipv6(v6),
     }
 }
 

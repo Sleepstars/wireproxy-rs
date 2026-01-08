@@ -1,0 +1,18 @@
+# Example test configuration for wireproxy-rs
+# Copy this file and fill in your WireGuard credentials
+
+[Interface]
+Address = 10.0.0.2/32
+PrivateKey = YOUR_PRIVATE_KEY_HERE
+DNS = 10.0.0.1
+
+[Peer]
+PublicKey = YOUR_PEER_PUBLIC_KEY_HERE
+Endpoint = your.wireguard.server:51820
+AllowedIPs = 0.0.0.0/0
+
+[Socks5]
+BindAddress = 127.0.0.1:1080
+
+[http]
+BindAddress = 127.0.0.1:8080

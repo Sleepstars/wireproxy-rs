@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use boringtun::device::allowed_ips::AllowedIps;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
@@ -22,7 +22,7 @@ use smoltcp::wire::{
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 
 use crate::buffer::BufferPool;
@@ -190,13 +190,21 @@ impl WireguardRuntime {
         let mut out = String::new();
 
         let _ = writeln!(&mut out, "protocol_version=1");
-        let _ = writeln!(&mut out, "private_key={}", encode_key(&self.inner.private_key));
+        let _ = writeln!(
+            &mut out,
+            "private_key={}",
+            encode_key(&self.inner.private_key)
+        );
         if let Some(port) = self.inner.listen_port {
             let _ = writeln!(&mut out, "listen_port={}", port);
         }
 
         for peer in &peers.peers {
-            let _ = writeln!(&mut out, "public_key={}", encode_key(&peer.config.public_key));
+            let _ = writeln!(
+                &mut out,
+                "public_key={}",
+                encode_key(&peer.config.public_key)
+            );
             if peer.config.preshared_key != [0u8; 32] {
                 let _ = writeln!(
                     &mut out,
@@ -218,17 +226,16 @@ impl WireguardRuntime {
                 let _ = writeln!(&mut out, "allowed_ip={net}");
             }
             let (last_handshake, tx_bytes, rx_bytes, _, _) = peer.tunn.stats();
-            if let Some(since) = last_handshake {
-                if let Some(when) = SystemTime::now().checked_sub(since) {
-                    if let Ok(delta) = when.duration_since(UNIX_EPOCH) {
-                        let _ = writeln!(&mut out, "last_handshake_time_sec={}", delta.as_secs());
-                        let _ = writeln!(
-                            &mut out,
-                            "last_handshake_time_nsec={}",
-                            delta.subsec_nanos()
-                        );
-                    }
-                }
+            if let Some(since) = last_handshake
+                && let Some(when) = SystemTime::now().checked_sub(since)
+                && let Ok(delta) = when.duration_since(UNIX_EPOCH)
+            {
+                let _ = writeln!(&mut out, "last_handshake_time_sec={}", delta.as_secs());
+                let _ = writeln!(
+                    &mut out,
+                    "last_handshake_time_nsec={}",
+                    delta.subsec_nanos()
+                );
             }
             let _ = writeln!(&mut out, "rx_bytes={rx_bytes}");
             let _ = writeln!(&mut out, "tx_bytes={tx_bytes}");
@@ -262,7 +269,7 @@ impl WireguardRuntime {
             let target_addr = to_ip_address(target);
             let v6_src = match target {
                 IpAddr::V4(dst) => {
-                    let dst_addr = Ipv4Address::from(dst);
+                    let dst_addr: Ipv4Address = dst;
                     let _src_addr = netstack
                         .iface
                         .get_source_address_ipv4(&dst_addr)
@@ -284,7 +291,7 @@ impl WireguardRuntime {
                     None
                 }
                 IpAddr::V6(dst) => {
-                    let dst_addr = Ipv6Address::from(dst);
+                    let dst_addr: Ipv6Address = dst;
                     let src_addr = netstack.iface.get_source_address_ipv6(&dst_addr);
                     let repr = Icmpv6Repr::EchoRequest {
                         ident,
@@ -408,7 +415,7 @@ impl WireguardRuntime {
                         return Ok(WgTcpConnection {
                             handle: Arc::new(std::sync::Mutex::new(Some(handle))),
                             runtime: self.clone(),
-                        })
+                        });
                     }
                     tcp::State::Closed => {
                         netstack.sockets.remove(handle);
@@ -421,11 +428,21 @@ impl WireguardRuntime {
         }
     }
 
-    pub async fn udp_exchange(&self, target: SocketAddr, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub async fn udp_exchange(
+        &self,
+        target: SocketAddr,
+        payload: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
         let handle = {
             let mut netstack = self.inner.netstack.lock();
-            let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; UDP_RX_BUFFER]);
-            let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; UDP_TX_BUFFER]);
+            let rx = udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; 4],
+                vec![0u8; UDP_RX_BUFFER],
+            );
+            let tx = udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; 4],
+                vec![0u8; UDP_TX_BUFFER],
+            );
             let mut socket = udp::Socket::new(rx, tx);
             let local_port = random_ephemeral_port();
             socket
@@ -533,7 +550,7 @@ impl WireguardRuntime {
 
     async fn timer_loop(&self) {
         let mut timer_buf = [0u8; 256];
-        
+
         loop {
             {
                 let mut peers = self.inner.peers.write();
@@ -604,10 +621,24 @@ impl WireguardRuntime {
             let mut peers = self.inner.peers.write();
             if let Some(peer_idx) = peers.peer_by_endpoint.get(&src).cloned() {
                 let peer = &mut peers.peers[peer_idx];
-                process_datagram(peer, src.ip(), data, &mut buf.buf[..], &self.inner.outbound_tx, &mut inbound_packets);
+                process_datagram(
+                    peer,
+                    src.ip(),
+                    data,
+                    &mut buf.buf[..],
+                    &self.inner.outbound_tx,
+                    &mut inbound_packets,
+                );
             } else {
                 for peer in &mut peers.peers {
-                    let handled = process_datagram(peer, src.ip(), data, &mut buf.buf[..], &self.inner.outbound_tx, &mut inbound_packets);
+                    let handled = process_datagram(
+                        peer,
+                        src.ip(),
+                        data,
+                        &mut buf.buf[..],
+                        &self.inner.outbound_tx,
+                        &mut inbound_packets,
+                    );
                     if handled {
                         break;
                     }
@@ -788,7 +819,7 @@ async fn outbound_sender_loop(udp: Arc<UdpSocket>, mut rx: mpsc::UnboundedReceiv
 /// Linux sendmmsg batch send implementation
 #[cfg(target_os = "linux")]
 fn send_batch_linux(fd: std::os::fd::RawFd, batch: &[Datagram]) -> anyhow::Result<()> {
-    use nix::sys::socket::{sendmmsg, MsgFlags, MultiHeaders, SockaddrStorage};
+    use nix::sys::socket::{MsgFlags, MultiHeaders, SockaddrStorage, sendmmsg};
     use std::io::IoSlice;
 
     let mut iovecs: Vec<[IoSlice<'_>; 1]> = Vec::with_capacity(batch.len());
@@ -802,8 +833,7 @@ fn send_batch_linux(fd: std::os::fd::RawFd, batch: &[Datagram]) -> anyhow::Resul
     }
 
     // nix 0.30 sendmmsg requires MultiHeaders preallocated buffer
-    let mut data: MultiHeaders<SockaddrStorage> =
-        MultiHeaders::preallocate(batch.len(), None);
+    let mut data: MultiHeaders<SockaddrStorage> = MultiHeaders::preallocate(batch.len(), None);
     let cmsgs: Vec<nix::sys::socket::ControlMessage<'_>> = vec![];
 
     sendmmsg(fd, &mut data, &iovecs, &addrs, &cmsgs, MsgFlags::empty())?;
@@ -845,8 +875,8 @@ fn encode_key(key: &[u8; 32]) -> String {
 
 fn to_ip_address(addr: IpAddr) -> IpAddress {
     match addr {
-        IpAddr::V4(v4) => IpAddress::Ipv4(Ipv4Address::from(v4)),
-        IpAddr::V6(v6) => IpAddress::Ipv6(Ipv6Address::from(v6)),
+        IpAddr::V4(v4) => IpAddress::Ipv4(v4),
+        IpAddr::V6(v6) => IpAddress::Ipv6(v6),
     }
 }
 

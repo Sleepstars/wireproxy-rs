@@ -17,7 +17,10 @@ use clap::Parser;
 use config::Config;
 
 #[derive(Parser, Debug)]
-#[command(name = "wireproxy-rs", about = "Userspace wireguard client for proxying")]
+#[command(
+    name = "wireproxy-rs",
+    about = "Userspace wireguard client for proxying"
+)]
 struct Args {
     /// Path of configuration file
     #[arg(short = 'c', long = "config")]
@@ -39,9 +42,8 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config_path = match args.config {
         Some(path) => path,
-        None => default_config_path().ok_or_else(|| {
-            anyhow::anyhow!("configuration path is required")
-        })?,
+        None => default_config_path()
+            .ok_or_else(|| anyhow::anyhow!("configuration path is required"))?,
     };
 
     let config = config::parse_config(&config_path)?;

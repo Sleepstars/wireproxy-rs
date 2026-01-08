@@ -246,7 +246,7 @@ async fn write_response(
 ) -> anyhow::Result<()> {
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}",
-        body.as_bytes().len(),
+        body.len(),
     );
     socket.write_all(response.as_bytes()).await?;
     Ok(())
