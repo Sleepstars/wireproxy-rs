@@ -9,8 +9,8 @@ NC='\033[0m'
 
 CONFIG_FILE="/tmp/wireproxy.conf"
 RESULTS_FILE="/tmp/benchmark_results.json"
-DURATION=10
-WARMUP=2
+DURATION=180
+WARMUP=5
 
 echo -e "${GREEN}=== WireProxy Performance Benchmark ===${NC}"
 echo ""
