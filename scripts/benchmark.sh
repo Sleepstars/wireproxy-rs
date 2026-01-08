@@ -71,9 +71,10 @@ measure_stats() {
 # Function to run throughput test via SOCKS5
 run_throughput_test() {
     local name=$1
-    echo -e "${YELLOW}Running throughput test for $name...${NC}"
+    # Print status to stderr so it doesn't pollute the return value
+    echo -e "${YELLOW}Running throughput test for $name...${NC}" >&2
 
-    # Use curl through SOCKS5 to download from iperf server
+    # Use iperf3 to test throughput
     local result=$(iperf3 -c 10.200.200.1 -p 5201 -t $DURATION --json 2>/dev/null || echo '{}')
     local bps=$(echo "$result" | jq -r '.end.sum_received.bits_per_second // 0' 2>/dev/null || echo "0")
     local mbps=$(echo "scale=2; $bps / 1000000" | bc 2>/dev/null || echo "0")
@@ -86,13 +87,16 @@ run_throughput_test() {
 # ============================================
 echo -e "${GREEN}[1/2] Benchmarking Go wireproxy...${NC}"
 
-$GO_WIREPROXY -c "$CONFIG_FILE" &
+$GO_WIREPROXY -c "$CONFIG_FILE" 2>/dev/null &
 GO_PID=$!
 sleep $WARMUP
 
-# Measure during load
+# Run throughput test and measure stats in parallel
+measure_stats $GO_PID "Go" $DURATION > /tmp/go_stats.txt &
+STATS_PID=$!
 GO_THROUGHPUT=$(run_throughput_test "Go")
-read GO_MEM GO_CPU <<< $(measure_stats $GO_PID "Go" $DURATION)
+wait $STATS_PID
+read GO_MEM GO_CPU < /tmp/go_stats.txt
 
 kill $GO_PID 2>/dev/null || true
 wait $GO_PID 2>/dev/null || true
@@ -103,12 +107,16 @@ sleep 2
 # ============================================
 echo -e "${GREEN}[2/2] Benchmarking Rust wireproxy...${NC}"
 
-$RS_WIREPROXY -c "$CONFIG_FILE" &
+$RS_WIREPROXY -c "$CONFIG_FILE" 2>/dev/null &
 RS_PID=$!
 sleep $WARMUP
 
+# Run throughput test and measure stats in parallel
+measure_stats $RS_PID "Rust" $DURATION > /tmp/rs_stats.txt &
+STATS_PID=$!
 RS_THROUGHPUT=$(run_throughput_test "Rust")
-read RS_MEM RS_CPU <<< $(measure_stats $RS_PID "Rust" $DURATION)
+wait $STATS_PID
+read RS_MEM RS_CPU < /tmp/rs_stats.txt
 
 kill $RS_PID 2>/dev/null || true
 wait $RS_PID 2>/dev/null || true
