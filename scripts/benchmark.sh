@@ -34,9 +34,8 @@ echo -e "${YELLOW}Starting HTTP server for throughput test...${NC}"
 # Create a 100MB test file
 dd if=/dev/zero of=/tmp/testfile bs=1M count=1000 2>/dev/null
 # Start Python HTTP server on WireGuard interface
-cd /tmp && python3 -m http.server 8080 --bind 10.200.200.1 &
+python3 -m http.server 8080 --bind 10.200.200.1 -d /tmp &
 HTTP_SERVER_PID=$!
-cd - > /dev/null
 sleep 2
 
 # Function to measure process stats
