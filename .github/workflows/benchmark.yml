@@ -28,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wireguard-tools iperf3 jq bc
+          sudo apt-get install -y wireguard-tools jq bc curl
 
       - name: Install original wireproxy (Go)
         run: go install github.com/pufferffish/wireproxy/cmd/wireproxy@latest

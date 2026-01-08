@@ -29,10 +29,15 @@ if [ ! -f "$RS_WIREPROXY" ]; then
     exit 1
 fi
 
-# Start iperf3 server on WireGuard interface
-echo -e "${YELLOW}Starting iperf3 server...${NC}"
-sudo iperf3 -s -B 10.200.200.1 -D -p 5201 2>/dev/null || true
-sleep 1
+# Start HTTP server on WireGuard interface for throughput testing
+echo -e "${YELLOW}Starting HTTP server for throughput test...${NC}"
+# Create a 100MB test file
+dd if=/dev/zero of=/tmp/testfile bs=1M count=1000 2>/dev/null
+# Start Python HTTP server on WireGuard interface
+cd /tmp && python3 -m http.server 8080 --bind 10.200.200.1 &
+HTTP_SERVER_PID=$!
+cd - > /dev/null
+sleep 2
 
 # Function to measure process stats
 measure_stats() {
@@ -71,13 +76,23 @@ measure_stats() {
 # Function to run throughput test via SOCKS5
 run_throughput_test() {
     local name=$1
-    # Print status to stderr so it doesn't pollute the return value
     echo -e "${YELLOW}Running throughput test for $name...${NC}" >&2
 
-    # Use iperf3 to test throughput
-    local result=$(iperf3 -c 10.200.200.1 -p 5201 -t $DURATION --json 2>/dev/null || echo '{}')
-    local bps=$(echo "$result" | jq -r '.end.sum_received.bits_per_second // 0' 2>/dev/null || echo "0")
-    local mbps=$(echo "scale=2; $bps / 1000000" | bc 2>/dev/null || echo "0")
+    # Use curl to download test file through SOCKS5 proxy multiple times
+    local total_bytes=0
+    local start_time=$(date +%s.%N)
+
+    for i in $(seq 1 $DURATION); do
+        local bytes=$(curl -s -x socks5://127.0.0.1:1080 -o /dev/null -w '%{size_download}' \
+            http://10.200.200.1:8080/testfile 2>/dev/null || echo "0")
+        total_bytes=$((total_bytes + bytes))
+    done
+
+    local end_time=$(date +%s.%N)
+    local elapsed=$(echo "$end_time - $start_time" | bc)
+
+    # Calculate Mbps: (bytes * 8) / (seconds * 1000000)
+    local mbps=$(echo "scale=2; ($total_bytes * 8) / ($elapsed * 1000000)" | bc 2>/dev/null || echo "0")
 
     echo "$mbps"
 }
@@ -167,4 +182,5 @@ echo ""
 echo -e "${GREEN}Results saved to $RESULTS_FILE${NC}"
 
 # Cleanup
-sudo pkill iperf3 2>/dev/null || true
+kill $HTTP_SERVER_PID 2>/dev/null || true
+rm -f /tmp/testfile
