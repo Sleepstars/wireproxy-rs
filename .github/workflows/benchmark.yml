@@ -1,0 +1,79 @@
+name: Performance Benchmark
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Performance Comparison
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wireguard-tools iperf3 jq bc
+
+      - name: Install original wireproxy (Go)
+        run: go install github.com/pufferffish/wireproxy/cmd/wireproxy@latest
+
+      - name: Build wireproxy-rs
+        run: cargo build --release
+
+      - name: Generate WireGuard keys
+        run: |
+          wg genkey | tee /tmp/server_private | wg pubkey > /tmp/server_public
+          wg genkey | tee /tmp/client_private | wg pubkey > /tmp/client_public
+
+      - name: Setup WireGuard server
+        run: |
+          sudo ip link add wg0 type wireguard
+          sudo ip addr add 10.200.200.1/24 dev wg0
+          sudo wg set wg0 \
+            private-key /tmp/server_private \
+            listen-port 51820 \
+            peer $(cat /tmp/client_public) allowed-ips 10.200.200.2/32
+          sudo ip link set wg0 up
+
+      - name: Create test configs
+        run: |
+          cat > /tmp/wireproxy.conf << EOF
+          [Interface]
+          Address = 10.200.200.2/32
+          PrivateKey = $(cat /tmp/client_private)
+
+          [Peer]
+          PublicKey = $(cat /tmp/server_public)
+          Endpoint = 127.0.0.1:51820
+          AllowedIPs = 10.200.200.0/24
+
+          [Socks5]
+          BindAddress = 127.0.0.1:1080
+          EOF
+
+      - name: Run benchmark
+        run: |
+          chmod +x ./scripts/benchmark.sh
+          ./scripts/benchmark.sh
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: /tmp/benchmark_results.json
