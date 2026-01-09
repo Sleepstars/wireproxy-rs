@@ -80,6 +80,7 @@ async fn test_socks5_handshake() {
 
     // SOCKS5 greeting: version 5, 1 method, no auth
     stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    stream.flush().await.unwrap();
 
     let mut response = [0u8; 2];
     stream.read_exact(&mut response).await.unwrap();

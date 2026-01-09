@@ -107,6 +107,7 @@ async fn negotiate_auth(socket: &mut TcpStream, config: &Socks5Config) -> anyhow
     };
 
     socket.write_all(&[SOCKS_VERSION, selected]).await?;
+    socket.flush().await?;
     if selected == METHOD_NO_ACCEPT {
         return Ok(false);
     }

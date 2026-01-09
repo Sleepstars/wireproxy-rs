@@ -11,8 +11,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  benchmark:
-    name: Performance Comparison
+  # Build job - builds both versions and uploads as artifacts
+  build:
+    name: Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,16 +26,48 @@ jobs:
         with:
           go-version: '1.21'
 
+      - name: Build wireproxy-rs
+        run: cargo build --release
+
+      - name: Install wireproxy (Go)
+        run: go install github.com/pufferffish/wireproxy/cmd/wireproxy@latest
+
+      - name: Upload Rust binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: wireproxy-rs
+          path: target/release/wireproxy-rs
+
+      - name: Upload Go binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: wireproxy-go
+          path: ~/go/bin/wireproxy
+
+  # Parallel benchmark jobs using matrix
+  benchmark:
+    name: Benchmark ${{ matrix.impl }}
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      matrix:
+        impl: [go, rust]
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y wireguard-tools jq bc curl
 
-      - name: Install original wireproxy (Go)
-        run: go install github.com/pufferffish/wireproxy/cmd/wireproxy@latest
+      - name: Download ${{ matrix.impl }} binary
+        uses: actions/download-artifact@v4
+        with:
+          name: wireproxy-${{ matrix.impl }}
+          path: /tmp/bin
 
-      - name: Build wireproxy-rs
-        run: cargo build --release
+      - name: Make binary executable
+        run: chmod +x /tmp/bin/*
 
       - name: Generate WireGuard keys
         run: |
@@ -51,7 +84,7 @@ jobs:
             peer $(cat /tmp/client_public) allowed-ips 10.200.200.2/32
           sudo ip link set wg0 up
 
-      - name: Create test configs
+      - name: Create test config
         run: |
           cat > /tmp/wireproxy.conf << EOF
           [Interface]
@@ -67,12 +100,87 @@ jobs:
           BindAddress = 127.0.0.1:1080
           EOF
 
+      - name: Start HTTP server
+        run: |
+          dd if=/dev/zero of=/tmp/testfile bs=1M count=1000 2>/dev/null
+          python3 -m http.server 8080 --bind 10.200.200.1 -d /tmp &
+          sleep 2
+
       - name: Run benchmark
         run: |
-          chmod +x ./scripts/benchmark.sh
-          ./scripts/benchmark.sh
+          chmod +x ./scripts/benchmark_single.sh
+          ./scripts/benchmark_single.sh ${{ matrix.impl }}
 
-      - name: Upload benchmark results
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.impl }}
+          path: /tmp/benchmark_${{ matrix.impl }}.json
+
+  # Combine results from parallel jobs
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    needs: benchmark
+    steps:
+      - name: Download Go results
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-go
+          path: /tmp
+
+      - name: Download Rust results
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-rust
+          path: /tmp
+
+      - name: Combine results
+        run: |
+          GO_MEM=$(jq -r '.memory_kb' /tmp/benchmark_go.json)
+          GO_CPU=$(jq -r '.cpu_percent' /tmp/benchmark_go.json)
+          GO_THROUGHPUT=$(jq -r '.throughput_mbps' /tmp/benchmark_go.json)
+
+          RS_MEM=$(jq -r '.memory_kb' /tmp/benchmark_rust.json)
+          RS_CPU=$(jq -r '.cpu_percent' /tmp/benchmark_rust.json)
+          RS_THROUGHPUT=$(jq -r '.throughput_mbps' /tmp/benchmark_rust.json)
+
+          MEM_IMPROVEMENT=$(echo "scale=1; (1 - $RS_MEM / $GO_MEM) * 100" | bc)
+          CPU_IMPROVEMENT=$(echo "scale=1; (1 - $RS_CPU / $GO_CPU) * 100" | bc 2>/dev/null || echo "N/A")
+
+          echo "=== Benchmark Results ==="
+          printf "%-20s %15s %15s\n" "Metric" "Go" "Rust"
+          printf "%-20s %15s %15s\n" "--------------------" "---------------" "---------------"
+          printf "%-20s %12s MB %12s MB\n" "Peak Memory" "$((GO_MEM / 1024))" "$((RS_MEM / 1024))"
+          printf "%-20s %14s%% %14s%%\n" "Avg CPU" "$GO_CPU" "$RS_CPU"
+          printf "%-20s %11s Mbps %11s Mbps\n" "Throughput" "$GO_THROUGHPUT" "$RS_THROUGHPUT"
+          echo ""
+          echo "Rust vs Go:"
+          echo "  Memory: ${MEM_IMPROVEMENT}% less"
+          echo "  CPU: ${CPU_IMPROVEMENT}% less"
+
+          # Save combined results
+          cat > /tmp/benchmark_results.json << EOF
+          {
+            "timestamp": "$(date -Iseconds)",
+            "go": {
+              "memory_kb": $GO_MEM,
+              "cpu_percent": $GO_CPU,
+              "throughput_mbps": $GO_THROUGHPUT
+            },
+            "rust": {
+              "memory_kb": $RS_MEM,
+              "cpu_percent": $RS_CPU,
+              "throughput_mbps": $RS_THROUGHPUT
+            },
+            "improvement": {
+              "memory_percent": $MEM_IMPROVEMENT,
+              "cpu_percent": "$CPU_IMPROVEMENT"
+            }
+          }
+          EOF
+
+      - name: Upload combined results
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results

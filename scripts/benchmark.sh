@@ -7,12 +7,17 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-CONFIG_FILE="/tmp/wireproxy.conf"
+GO_CONFIG_FILE="/tmp/wireproxy_go.conf"
+RS_CONFIG_FILE="/tmp/wireproxy_rs.conf"
 RESULTS_FILE="/tmp/benchmark_results.json"
 DURATION=180
 WARMUP=5
 
-echo -e "${GREEN}=== WireProxy Performance Benchmark ===${NC}"
+# Different ports for parallel testing
+GO_SOCKS_PORT=1080
+RS_SOCKS_PORT=1081
+
+echo -e "${GREEN}=== WireProxy Performance Benchmark (Parallel) ===${NC}"
 echo ""
 
 # Paths
@@ -29,9 +34,22 @@ if [ ! -f "$RS_WIREPROXY" ]; then
     exit 1
 fi
 
+# Create separate config files with different ports
+create_config() {
+    local config_file=$1
+    local socks_port=$2
+
+    # Read base config and modify SOCKS5 port
+    sed "s/BindAddress = 127.0.0.1:1080/BindAddress = 127.0.0.1:$socks_port/" \
+        /tmp/wireproxy.conf > "$config_file"
+}
+
+create_config "$GO_CONFIG_FILE" "$GO_SOCKS_PORT"
+create_config "$RS_CONFIG_FILE" "$RS_SOCKS_PORT"
+
 # Start HTTP server on WireGuard interface for throughput testing
 echo -e "${YELLOW}Starting HTTP server for throughput test...${NC}"
-# Create a 100MB test file
+# Create a 1GB test file
 dd if=/dev/zero of=/tmp/testfile bs=1M count=1000 2>/dev/null
 # Start Python HTTP server on WireGuard interface
 python3 -m http.server 8080 --bind 10.200.200.1 -d /tmp &
@@ -75,14 +93,15 @@ measure_stats() {
 # Function to run throughput test via SOCKS5
 run_throughput_test() {
     local name=$1
-    echo -e "${YELLOW}Running throughput test for $name...${NC}" >&2
+    local socks_port=$2
+    echo -e "${YELLOW}Running throughput test for $name on port $socks_port...${NC}" >&2
 
     # Use curl to download test file through SOCKS5 proxy multiple times
     local total_bytes=0
     local start_time=$(date +%s.%N)
 
     for i in $(seq 1 $DURATION); do
-        local bytes=$(curl -s -x socks5://127.0.0.1:1080 -o /dev/null -w '%{size_download}' \
+        local bytes=$(curl -s -x socks5://127.0.0.1:$socks_port -o /dev/null -w '%{size_download}' \
             http://10.200.200.1:8080/testfile 2>/dev/null || echo "0")
         total_bytes=$((total_bytes + bytes))
     done
@@ -97,43 +116,49 @@ run_throughput_test() {
 }
 
 # ============================================
-# Benchmark Go wireproxy
+# Start both wireproxy instances
 # ============================================
-echo -e "${GREEN}[1/2] Benchmarking Go wireproxy...${NC}"
+echo -e "${GREEN}Starting both wireproxy instances in parallel...${NC}"
 
-$GO_WIREPROXY -c "$CONFIG_FILE" 2>/dev/null &
+$GO_WIREPROXY -c "$GO_CONFIG_FILE" 2>/dev/null &
 GO_PID=$!
-sleep $WARMUP
 
-# Run throughput test and measure stats in parallel
-measure_stats $GO_PID "Go" $DURATION > /tmp/go_stats.txt &
-STATS_PID=$!
-GO_THROUGHPUT=$(run_throughput_test "Go")
-wait $STATS_PID
-read GO_MEM GO_CPU < /tmp/go_stats.txt
-
-kill $GO_PID 2>/dev/null || true
-wait $GO_PID 2>/dev/null || true
-sleep 2
-
-# ============================================
-# Benchmark Rust wireproxy
-# ============================================
-echo -e "${GREEN}[2/2] Benchmarking Rust wireproxy...${NC}"
-
-$RS_WIREPROXY -c "$CONFIG_FILE" 2>/dev/null &
+$RS_WIREPROXY -c "$RS_CONFIG_FILE" 2>/dev/null &
 RS_PID=$!
+
 sleep $WARMUP
 
-# Run throughput test and measure stats in parallel
-measure_stats $RS_PID "Rust" $DURATION > /tmp/rs_stats.txt &
-STATS_PID=$!
-RS_THROUGHPUT=$(run_throughput_test "Rust")
-wait $STATS_PID
-read RS_MEM RS_CPU < /tmp/rs_stats.txt
+# ============================================
+# Run benchmarks in parallel
+# ============================================
+echo -e "${GREEN}Running benchmarks in parallel...${NC}"
 
-kill $RS_PID 2>/dev/null || true
-wait $RS_PID 2>/dev/null || true
+# Start all measurements in background
+measure_stats $GO_PID "Go" $DURATION > /tmp/go_stats.txt &
+GO_STATS_PID=$!
+
+measure_stats $RS_PID "Rust" $DURATION > /tmp/rs_stats.txt &
+RS_STATS_PID=$!
+
+# Run throughput tests in parallel (output to temp files)
+run_throughput_test "Go" $GO_SOCKS_PORT > /tmp/go_throughput.txt &
+GO_THROUGHPUT_PID=$!
+
+run_throughput_test "Rust" $RS_SOCKS_PORT > /tmp/rs_throughput.txt &
+RS_THROUGHPUT_PID=$!
+
+# Wait for all tests to complete
+wait $GO_STATS_PID $RS_STATS_PID $GO_THROUGHPUT_PID $RS_THROUGHPUT_PID
+
+# Read results
+read GO_MEM GO_CPU < /tmp/go_stats.txt
+read RS_MEM RS_CPU < /tmp/rs_stats.txt
+GO_THROUGHPUT=$(cat /tmp/go_throughput.txt)
+RS_THROUGHPUT=$(cat /tmp/rs_throughput.txt)
+
+# Cleanup processes
+kill $GO_PID $RS_PID 2>/dev/null || true
+wait $GO_PID $RS_PID 2>/dev/null || true
 
 # ============================================
 # Results
