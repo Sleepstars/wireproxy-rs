@@ -41,17 +41,25 @@ PID=$!
 sleep $WARMUP
 
 # Measure stats in background
+# Runs until the shared end timestamp so total benchmark time is fixed.
 measure_stats() {
     local pid=$1
-    local duration=$2
+    local end_ns=$2
     local max_mem=0
     local total_cpu=0
     local samples=0
 
-    for i in $(seq 1 $duration); do
-        if ps -p $pid > /dev/null 2>&1; then
-            local mem=$(ps -o rss= -p $pid 2>/dev/null | tr -d ' ')
-            local cpu=$(ps -o %cpu= -p $pid 2>/dev/null | tr -d ' ')
+    while true; do
+        local now_ns
+        now_ns=$(date +%s%N)
+        if [ "$now_ns" -ge "$end_ns" ]; then
+            break
+        fi
+
+        if ps -p "$pid" > /dev/null 2>&1; then
+            local mem cpu
+            mem=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+            cpu=$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d ' ')
 
             if [ -n "$mem" ] && [ "$mem" -gt "$max_mem" ]; then
                 max_mem=$mem
@@ -61,11 +69,22 @@ measure_stats() {
                 samples=$((samples + 1))
             fi
         fi
-        sleep 1
+
+        # Sleep up to 1s but don't significantly overshoot the deadline.
+        now_ns=$(date +%s%N)
+        local remaining_ns=$((end_ns - now_ns))
+        if [ "$remaining_ns" -le 0 ]; then
+            break
+        fi
+        if [ "$remaining_ns" -lt 1000000000 ]; then
+            sleep "$(echo "scale=3; $remaining_ns / 1000000000" | bc)"
+        else
+            sleep 1
+        fi
     done
 
     local avg_cpu=0
-    if [ $samples -gt 0 ]; then
+    if [ "$samples" -gt 0 ]; then
         avg_cpu=$(echo "scale=2; $total_cpu / $samples" | bc)
     fi
 
@@ -73,19 +92,46 @@ measure_stats() {
 }
 
 # Run throughput test
+# Runs until the shared end timestamp so total benchmark time is fixed.
 run_throughput_test() {
+    local start_ns=$1
+    local end_ns=$2
     local total_bytes=0
-    local start_time=$(date +%s.%N)
 
-    for i in $(seq 1 $DURATION); do
-        local bytes=$(curl -s -x socks5://127.0.0.1:1080 -o /dev/null -w '%{size_download}' \
-            http://10.200.200.1:8080/testfile 2>/dev/null || echo "0")
+    while true; do
+        local now_ns
+        now_ns=$(date +%s%N)
+        if [ "$now_ns" -ge "$end_ns" ]; then
+            break
+        fi
+
+        local remaining_ns=$((end_ns - now_ns))
+        if [ "$remaining_ns" -le 0 ]; then
+            break
+        fi
+
+        local remaining_s
+        remaining_s=$(echo "scale=3; $remaining_ns / 1000000000" | bc)
+
+        # curl may time out on the final iteration; don't let `set -e` abort the script.
+        # We still want to count bytes downloaded so far.
+        local bytes
+        bytes=$(curl -s --max-time "$remaining_s" -x socks5://127.0.0.1:1080 -o /dev/null -w '%{size_download}' \
+            http://10.200.200.1:8080/testfile 2>/dev/null || true)
+
+        if [ -z "$bytes" ]; then
+            bytes=0
+        fi
         total_bytes=$((total_bytes + bytes))
     done
 
-    local end_time=$(date +%s.%N)
-    local elapsed=$(echo "$end_time - $start_time" | bc)
-    local mbps=$(echo "scale=2; ($total_bytes * 8) / ($elapsed * 1000000)" | bc 2>/dev/null || echo "0")
+    local end_ns_actual
+    end_ns_actual=$(date +%s%N)
+    local elapsed_s
+    elapsed_s=$(echo "scale=3; ($end_ns_actual - $start_ns) / 1000000000" | bc)
+
+    local mbps
+    mbps=$(echo "scale=2; ($total_bytes * 8) / ($elapsed_s * 1000000)" | bc 2>/dev/null || echo "0")
 
     echo "$mbps"
 }
@@ -93,10 +139,13 @@ run_throughput_test() {
 echo -e "${YELLOW}Running benchmark...${NC}"
 
 # Run stats and throughput in parallel
-measure_stats $PID $DURATION > /tmp/stats.txt &
+START_NS=$(date +%s%N)
+END_NS=$((START_NS + DURATION * 1000000000))
+
+measure_stats "$PID" "$END_NS" > /tmp/stats.txt &
 STATS_PID=$!
 
-THROUGHPUT=$(run_throughput_test)
+THROUGHPUT=$(run_throughput_test "$START_NS" "$END_NS")
 
 wait $STATS_PID
 read MEM CPU < /tmp/stats.txt
