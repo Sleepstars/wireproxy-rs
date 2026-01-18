@@ -35,7 +35,7 @@ jobs:
       - name: Upload Rust binary
         uses: actions/upload-artifact@v4
         with:
-          name: wireproxy-rs
+          name: wireproxy-rust
           path: target/release/wireproxy-rs
 
       - name: Upload Go binary
