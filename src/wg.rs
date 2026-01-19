@@ -70,7 +70,7 @@ fn spawn_decryption_workers(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<E
                         }
                     }
 
-                    inner.notify.notify_waiters();
+                    inner.poll_notify.notify_one();
                     continue;
                 }
 
@@ -103,7 +103,7 @@ fn spawn_decryption_workers(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<E
                     }
                 }
 
-                inner.notify.notify_waiters();
+                inner.poll_notify.notify_one();
             }
         });
     }
@@ -226,8 +226,10 @@ struct Inner {
     decrypt_tx: mpsc::UnboundedSender<EncryptedDatagram>,
     /// Plain IP packets from the netstack that should be encapsulated.
     encrypt_tx: mpsc::UnboundedSender<OutboundPacket>,
-    /// Notify for netstack events
-    notify: Notify,
+    /// Wakes the smoltcp poll loop when new work arrives.
+    poll_notify: Notify,
+    /// Wakes tasks waiting on socket readiness/state changes.
+    io_notify: Notify,
     /// Started flag
     started: AtomicBool,
     /// DNS servers
@@ -324,7 +326,8 @@ impl WireguardRuntime {
             outbound_tx,
             decrypt_tx,
             encrypt_tx,
-            notify: Notify::new(),
+            poll_notify: Notify::new(),
+            io_notify: Notify::new(),
             started: AtomicBool::new(false),
             dns_servers: config.dns.clone(),
             private_key: config.private_key,
@@ -470,7 +473,7 @@ impl WireguardRuntime {
             (handle, target_addr, v6_src)
         };
 
-        self.inner.notify.notify_waiters();
+        self.inner.poll_notify.notify_one();
 
         let deadline = Instant::now() + timeout;
         let mut recv_buf = [0u8; 512];
@@ -486,7 +489,7 @@ impl WireguardRuntime {
                         && matches_echo_reply(&recv_buf[..len], target_addr, v6_src, ident, seq_no)
                     {
                         netstack.sockets.remove(handle);
-                        self.inner.notify.notify_waiters();
+                        self.inner.poll_notify.notify_one();
                         return Ok(());
                     }
                 }
@@ -495,11 +498,11 @@ impl WireguardRuntime {
             if Instant::now() >= deadline {
                 let mut netstack = self.inner.netstack.lock();
                 netstack.sockets.remove(handle);
-                self.inner.notify.notify_waiters();
+                self.inner.poll_notify.notify_one();
                 anyhow::bail!("icmp ping timed out");
             }
 
-            self.inner.notify.notified().await;
+            self.inner.io_notify.notified().await;
         }
     }
 
@@ -529,7 +532,7 @@ impl WireguardRuntime {
             handle
         };
 
-        self.inner.notify.notify_waiters();
+        self.inner.poll_notify.notify_one();
 
         let mut conn = WgTcpConnection {
             handle: Arc::new(std::sync::Mutex::new(Some(handle))),
@@ -558,7 +561,7 @@ impl WireguardRuntime {
             netstack.add_socket(socket)
         };
 
-        self.inner.notify.notify_waiters();
+        self.inner.poll_notify.notify_one();
 
         loop {
             {
@@ -578,7 +581,7 @@ impl WireguardRuntime {
                     _ => {}
                 }
             }
-            self.inner.notify.notified().await;
+            self.inner.io_notify.notified().await;
         }
     }
 
@@ -613,7 +616,7 @@ impl WireguardRuntime {
             handle
         };
 
-        self.inner.notify.notify_waiters();
+        self.inner.poll_notify.notify_one();
 
         let deadline = tokio::time::Instant::now() + DNS_TIMEOUT;
         loop {
@@ -634,7 +637,7 @@ impl WireguardRuntime {
                 netstack.sockets.remove(handle);
                 anyhow::bail!("udp exchange timed out");
             }
-            self.inner.notify.notified().await;
+            self.inner.io_notify.notified().await;
         }
     }
 
@@ -665,22 +668,32 @@ impl WireguardRuntime {
             };
 
             if did_work {
-                self.inner.notify.notify_waiters();
+                // The poll loop advanced socket state; wake tasks waiting on readiness.
+                self.inner.io_notify.notify_waiters();
             }
 
             if !frames.is_empty() {
                 self.send_frames(frames);
             }
 
-            // Event-driven: wait for notify or smoltcp's poll_delay
-            let sleep_duration = delay
-                .filter(|d| *d > Duration::ZERO)
-                .unwrap_or(Duration::from_millis(5));
-
-            tokio::select! {
-                biased;
-                _ = self.inner.notify.notified() => {}
-                _ = tokio::time::sleep(sleep_duration) => {}
+            // Event-driven: use smoltcp's poll_delay to avoid busy looping.
+            // `poll_delay == 0` means "poll again ASAP" (e.g. more queued work),
+            // so yield instead of sleeping for a fixed interval.
+            match delay {
+                Some(d) if d.is_zero() => {
+                    tokio::task::yield_now().await;
+                }
+                Some(d) => {
+                    tokio::select! {
+                        biased;
+                        _ = self.inner.poll_notify.notified() => {}
+                        _ = tokio::time::sleep(d) => {}
+                    }
+                }
+                None => {
+                    // No timers scheduled by smoltcp; sleep until we have new work.
+                    self.inner.poll_notify.notified().await;
+                }
             }
         }
     }
@@ -911,7 +924,7 @@ impl WgTcpConnection {
                     return Ok(0);
                 }
             }
-            self.runtime.inner.notify.notified().await;
+            self.runtime.inner.io_notify.notified().await;
         }
     }
 
@@ -930,11 +943,11 @@ impl WgTcpConnection {
                         .send_slice(&buf[offset..])
                         .map_err(|e| anyhow::anyhow!("tcp send error: {e:?}"))?;
                     offset += written;
-                    self.runtime.inner.notify.notify_waiters();
+                    self.runtime.inner.poll_notify.notify_one();
                     continue;
                 }
             }
-            self.runtime.inner.notify.notified().await;
+            self.runtime.inner.io_notify.notified().await;
         }
         Ok(offset)
     }
@@ -950,7 +963,7 @@ impl WgTcpConnection {
             socket.close();
         }
         netstack.sockets.remove(handle);
-        self.runtime.inner.notify.notify_waiters();
+        self.runtime.inner.poll_notify.notify_one();
     }
 
     async fn wait_established(&mut self) -> anyhow::Result<()> {
@@ -983,7 +996,7 @@ impl WgTcpConnection {
                 anyhow::bail!("tcp connection timed out");
             }
 
-            self.runtime.inner.notify.notified().await;
+            self.runtime.inner.io_notify.notified().await;
         }
     }
 }

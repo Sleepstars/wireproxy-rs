@@ -19,8 +19,9 @@ pub async fn proxy_tcp<C>(mut client: C, mut remote: WgTcpConnection) -> anyhow:
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut client_buf = vec![0u8; 32 * 1024];
-    let mut remote_buf = vec![0u8; 32 * 1024];
+    // Larger buffers reduce read/write syscalls and lock contention in the smoltcp path.
+    let mut client_buf = vec![0u8; 256 * 1024];
+    let mut remote_buf = vec![0u8; 256 * 1024];
 
     loop {
         tokio::select! {
@@ -83,8 +84,8 @@ where
 pub async fn proxy_stdio(mut remote: WgTcpConnection) -> anyhow::Result<()> {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    let mut stdin_buf = vec![0u8; 16 * 1024];
-    let mut remote_buf = vec![0u8; 16 * 1024];
+    let mut stdin_buf = vec![0u8; 64 * 1024];
+    let mut remote_buf = vec![0u8; 64 * 1024];
 
     loop {
         tokio::select! {
