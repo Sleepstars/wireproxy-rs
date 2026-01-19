@@ -701,17 +701,10 @@ impl WireguardRuntime {
 
             let fd = self.inner.udp.as_raw_fd();
 
-            // Preallocate buffers + headers once and reuse.
-            //
-            // We keep the backing buffers alive for the full lifetime of this loop and
-            // (re)construct IoSliceMut values on demand.
+            // Preallocate buffers once and reuse. We rebuild IoSliceMut wrappers on demand.
             let mut bufs: Vec<Box<[u8; crate::buffer::WG_BUFFER_SIZE]>> = (0..BATCH_SIZE)
                 .map(|_| Box::new([0u8; crate::buffer::WG_BUFFER_SIZE]))
                 .collect();
-            let buf_ptrs: Vec<*mut u8> = bufs.iter_mut().map(|b| b.as_mut_ptr()).collect();
-
-            let mut headers: MultiHeaders<SockaddrStorage> =
-                MultiHeaders::preallocate(BATCH_SIZE, None);
 
             loop {
                 // IMPORTANT: don't spin on `try_io` when the socket isn't ready.
@@ -721,72 +714,76 @@ impl WireguardRuntime {
                     continue;
                 }
 
-                let res = self.inner.udp.try_io(Interest::READABLE, || {
-                    // Rebuild IoSliceMut wrappers for recvmmsg.
-                    let mut iovecs: Vec<[IoSliceMut<'_>; 1]> = Vec::with_capacity(BATCH_SIZE);
-                    for &ptr in &buf_ptrs {
-                        // SAFETY: ptr points into `bufs`, which outlives this closure.
-                        let slice = unsafe {
-                            std::slice::from_raw_parts_mut(ptr, crate::buffer::WG_BUFFER_SIZE)
-                        };
-                        iovecs.push([IoSliceMut::new(slice)]);
-                    }
+                // `MultiHeaders` (and the underlying `mmsghdr`) is `!Send` due to raw pointers.
+                // Create it after the await so this async fn remains `Send` and can be spawned.
+                let mut headers: MultiHeaders<SockaddrStorage> =
+                    MultiHeaders::preallocate(BATCH_SIZE, None);
 
-                    let mut results = recvmmsg(
-                        fd,
-                        &mut headers,
-                        iovecs.iter_mut(),
-                        MsgFlags::MSG_DONTWAIT,
-                        None,
-                    )
-                    .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-
-                    // `recvmmsg` returns results in the same order as the provided iovecs.
-                    // IMPORTANT: even if we skip a message (missing addr / unsupported family),
-                    // we must still advance the index so we don't mis-associate buffers.
-                    let mut idx = 0usize;
-                    for msg in &mut results {
-                        let buf = match bufs.get(idx) {
-                            Some(b) => b,
-                            None => break,
-                        };
-                        idx += 1;
-
-                        let len = msg.bytes;
-                        if len == 0 {
-                            continue;
+                // Drain as many datagrams as possible until we would block.
+                loop {
+                    let res = self.inner.udp.try_io(Interest::READABLE, || {
+                        // Rebuild IoSliceMut wrappers for recvmmsg.
+                        let mut iovecs: Vec<[IoSliceMut<'_>; 1]> = Vec::with_capacity(BATCH_SIZE);
+                        for buf in bufs.iter_mut() {
+                            iovecs.push([IoSliceMut::new(&mut buf[..])]);
                         }
 
-                        let Some(addr) = msg.address else {
-                            continue;
-                        };
-                        let src = match addr.family() {
-                            Some(nix::sys::socket::AddressFamily::Inet) => {
-                                std::net::SocketAddr::from(*addr.as_sockaddr_in().unwrap())
-                            }
-                            Some(nix::sys::socket::AddressFamily::Inet6) => {
-                                std::net::SocketAddr::from(*addr.as_sockaddr_in6().unwrap())
-                            }
-                            _ => continue,
-                        };
+                        let mut results = recvmmsg(
+                            fd,
+                            &mut headers,
+                            iovecs.iter_mut(),
+                            MsgFlags::MSG_DONTWAIT,
+                            None,
+                        )
+                        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
 
-                        // Each iovec points into the corresponding bufs[idx] buffer.
-                        if let Err(err) = self.handle_incoming(src, &buf[..len]) {
-                            log::error!("failed handling udp packet: {err:#}");
+                        // Release the mutable borrows from `iovecs` before accessing `bufs` again.
+                        drop(iovecs);
+
+                        // `recvmmsg` returns results in the same order as the provided iovecs.
+                        for (idx, msg) in results.iter_mut().enumerate() {
+                            let buf = match bufs.get(idx) {
+                                Some(b) => b,
+                                None => break,
+                            };
+
+                            let len = msg.bytes;
+                            if len == 0 {
+                                continue;
+                            }
+
+                            let Some(addr) = msg.address else {
+                                continue;
+                            };
+                            let src = match addr.family() {
+                                Some(nix::sys::socket::AddressFamily::Inet) => {
+                                    std::net::SocketAddr::from(*addr.as_sockaddr_in().unwrap())
+                                }
+                                Some(nix::sys::socket::AddressFamily::Inet6) => {
+                                    std::net::SocketAddr::from(*addr.as_sockaddr_in6().unwrap())
+                                }
+                                _ => continue,
+                            };
+
+                            // Each iovec points into the corresponding `bufs[idx]` buffer.
+                            if let Err(err) = self.handle_incoming(src, &buf[..len]) {
+                                log::error!("failed handling udp packet: {err:#}");
+                            }
                         }
-                    }
 
-                    Ok(())
-                });
+                        Ok(())
+                    });
 
-                match res {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        // Readiness was false-positive; go back to `readable().await`.
-                        continue;
-                    }
-                    Err(err) => {
-                        log::error!("udp recv error: {err}");
+                    match res {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            // Readiness was false-positive or we've drained the socket.
+                            break;
+                        }
+                        Err(err) => {
+                            log::error!("udp recv error: {err}");
+                            break;
+                        }
                     }
                 }
             }
