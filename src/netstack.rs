@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Instant as StdInstant;
 
 use rand::RngCore;
@@ -10,6 +11,24 @@ use smoltcp::wire::{
     HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Address,
 };
 
+use crate::buffer::{BufferPool, PooledSmallBuffer, WG_BUFFER_SIZE};
+
+pub(crate) struct PacketBuf {
+    buf: PooledSmallBuffer,
+    len: usize,
+}
+
+impl PacketBuf {
+    pub(crate) fn new(buf: PooledSmallBuffer, len: usize) -> Self {
+        debug_assert!(len <= WG_BUFFER_SIZE);
+        Self { buf, len }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
 pub(crate) struct Netstack {
     pub(crate) device: IpDevice,
     pub(crate) iface: Interface,
@@ -18,8 +37,8 @@ pub(crate) struct Netstack {
 }
 
 impl Netstack {
-    pub(crate) fn new(addresses: &[std::net::IpAddr], mtu: usize) -> Self {
-        let mut device = IpDevice::new(mtu);
+    pub(crate) fn new(addresses: &[std::net::IpAddr], mtu: usize, pool: Arc<BufferPool>) -> Self {
+        let mut device = IpDevice::new(mtu, pool);
         let mut config = Config::new(HardwareAddress::Ip);
         let mut rng = rand::rng();
         config.random_seed = rng.next_u64();
@@ -44,10 +63,10 @@ impl Netstack {
                 }
             }
 
-            // Add a link-local IPv6 address if only IPv4 is configured
-            // This prevents smoltcp from panicking when trying to send IPv6 packets
+            // Add a link-local IPv6 address if only IPv4 is configured.
+            // This prevents smoltcp from panicking when trying to send IPv6 packets.
             if has_ipv4 && !has_ipv6 {
-                // Use fe80::1 as a dummy link-local address
+                // Use fe80::1 as a dummy link-local address.
                 let ipv6_ll = IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 128);
                 if addrs.push(ipv6_ll).is_err() {
                     log::warn!("interface address list full, skipping IPv6 link-local");
@@ -55,8 +74,8 @@ impl Netstack {
             }
         });
 
-        // Add default routes for IPv4 and IPv6
-        // In a WireGuard tunnel, all traffic goes through the tunnel (no gateway needed)
+        // Add default routes for IPv4 and IPv6.
+        // In a WireGuard tunnel, all traffic goes through the tunnel (no gateway needed).
         iface
             .routes_mut()
             .add_default_ipv4_route(Ipv4Address::UNSPECIFIED)
@@ -85,11 +104,11 @@ impl Netstack {
             .map(|delay| std::time::Duration::from_millis(delay.total_millis()))
     }
 
-    pub(crate) fn push_inbound(&mut self, packet: Vec<u8>) {
+    pub(crate) fn push_inbound(&mut self, packet: PacketBuf) {
         self.device.push_rx(packet);
     }
 
-    pub(crate) fn drain_outbound(&mut self) -> Vec<Vec<u8>> {
+    pub(crate) fn drain_outbound(&mut self) -> Vec<PacketBuf> {
         self.device.drain_tx()
     }
 
@@ -105,7 +124,7 @@ impl Netstack {
         self.sockets.add(socket)
     }
 
-    /// Connect a TCP socket - handles the borrow checker issue with iface.context()
+    /// Connect a TCP socket - handles the borrow checker issue with iface.context().
     pub(crate) fn tcp_connect(
         &mut self,
         handle: SocketHandle,
@@ -125,31 +144,33 @@ fn to_ip_address(addr: std::net::IpAddr) -> IpAddress {
 }
 
 pub(crate) struct IpDevice {
-    rx: VecDeque<Vec<u8>>,
-    tx: VecDeque<Vec<u8>>,
+    rx: VecDeque<PacketBuf>,
+    tx: VecDeque<PacketBuf>,
     mtu: usize,
+    pool: Arc<BufferPool>,
 }
 
 impl IpDevice {
-    pub(crate) fn new(mtu: usize) -> Self {
+    pub(crate) fn new(mtu: usize, pool: Arc<BufferPool>) -> Self {
         Self {
             rx: VecDeque::new(),
             tx: VecDeque::new(),
             mtu,
+            pool,
         }
     }
 
-    fn push_rx(&mut self, packet: Vec<u8>) {
+    fn push_rx(&mut self, packet: PacketBuf) {
         self.rx.push_back(packet);
     }
 
-    fn drain_tx(&mut self) -> Vec<Vec<u8>> {
+    fn drain_tx(&mut self) -> Vec<PacketBuf> {
         self.tx.drain(..).collect()
     }
 }
 
 pub(crate) struct IpRxToken {
-    buffer: Vec<u8>,
+    packet: PacketBuf,
 }
 
 impl RxToken for IpRxToken {
@@ -157,12 +178,13 @@ impl RxToken for IpRxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(&self.buffer)
+        f(self.packet.as_slice())
     }
 }
 
 pub(crate) struct IpTxToken<'a> {
-    queue: &'a mut VecDeque<Vec<u8>>,
+    queue: &'a mut VecDeque<PacketBuf>,
+    pool: &'a Arc<BufferPool>,
 }
 
 impl<'a> TxToken for IpTxToken<'a> {
@@ -170,9 +192,12 @@ impl<'a> TxToken for IpTxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = vec![0u8; len];
-        let result = f(&mut buffer);
-        self.queue.push_back(buffer);
+        debug_assert!(len <= WG_BUFFER_SIZE);
+
+        // Allocate from the pool so we avoid per-packet `Vec` allocations.
+        let mut buf = self.pool.get_small();
+        let result = f(&mut buf[..len]);
+        self.queue.push_back(PacketBuf::new(buf, len));
         result
     }
 }
@@ -190,9 +215,10 @@ impl Device for IpDevice {
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let packet = self.rx.pop_front()?;
         Some((
-            IpRxToken { buffer: packet },
+            IpRxToken { packet },
             IpTxToken {
                 queue: &mut self.tx,
+                pool: &self.pool,
             },
         ))
     }
@@ -200,6 +226,7 @@ impl Device for IpDevice {
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(IpTxToken {
             queue: &mut self.tx,
+            pool: &self.pool,
         })
     }
 

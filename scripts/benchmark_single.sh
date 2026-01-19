@@ -21,9 +21,19 @@ echo -e "${GREEN}=== WireProxy Benchmark: $IMPL ===${NC}"
 
 # Determine binary path
 if [ "$IMPL" = "go" ]; then
-    BINARY="/tmp/bin/wireproxy"
+    # Prefer the CI artifact location, fall back to local install.
+    if [ -f "/tmp/bin/wireproxy" ]; then
+        BINARY="/tmp/bin/wireproxy"
+    else
+        BINARY="$(command -v wireproxy || echo "$HOME/go/bin/wireproxy")"
+    fi
 elif [ "$IMPL" = "rust" ]; then
-    BINARY="/tmp/bin/wireproxy-rs"
+    # Prefer the CI artifact location, fall back to local build output.
+    if [ -f "/tmp/bin/wireproxy-rs" ]; then
+        BINARY="/tmp/bin/wireproxy-rs"
+    else
+        BINARY="./target/release/wireproxy-rs"
+    fi
 else
     echo -e "${RED}Unknown implementation: $IMPL${NC}"
     exit 1

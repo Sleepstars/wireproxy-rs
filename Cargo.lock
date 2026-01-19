@@ -1755,7 +1755,6 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "boringtun",
- "bytes",
  "clap",
  "env_logger",
  "hickory-proto",

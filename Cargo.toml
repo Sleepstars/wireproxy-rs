@@ -7,7 +7,6 @@ edition = "2024"
 anyhow = "1.0"
 base64 = "0.22"
 boringtun = { version = "0.6", features = ["device"] }
-bytes = "1.9"
 clap = { version = "4.5", features = ["derive"] }
 env_logger = "0.11"
 ipnet = "2.9"
@@ -22,4 +21,4 @@ tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "net", "t
 hickory-proto = "0.25"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.30.1", features = ["socket", "uio", "net"] }
+nix = { version = "0.30.1", features = ["socket", "uio", "net", "time"] }

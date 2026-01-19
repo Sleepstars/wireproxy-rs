@@ -1,20 +1,25 @@
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+
 use parking_lot::Mutex;
 
-/// Fixed-size buffer for WireGuard operations (MTU + overhead)
+/// Fixed-size buffer for WireGuard operations (MTU + overhead).
+///
+/// NOTE: This constant must be large enough to hold both encrypted WireGuard UDP packets
+/// and decrypted IP packets produced/consumed by the smoltcp device.
 pub const WG_BUFFER_SIZE: usize = 2048;
-/// Fixed-size buffer for TCP proxy operations
+
+/// Fixed-size buffer for TCP proxy operations.
 pub const TCP_BUFFER_SIZE: usize = 32 * 1024;
 
-/// A pool of reusable buffers to reduce allocations
+/// A pool of reusable buffers to reduce allocations on hot paths.
 pub struct BufferPool {
-    // We intentionally use Box here to avoid stack overflow when moving large arrays
+    // We intentionally use Box here to avoid stack overflow when moving large arrays.
     #[allow(clippy::vec_box)]
     small_buffers: Mutex<Vec<Box<[u8; WG_BUFFER_SIZE]>>>,
     #[allow(clippy::vec_box)]
     large_buffers: Mutex<Vec<Box<[u8; TCP_BUFFER_SIZE]>>>,
-    #[allow(dead_code)]
     max_small: usize,
-    #[allow(dead_code)]
     max_large: usize,
 }
 
@@ -28,41 +33,46 @@ impl BufferPool {
         }
     }
 
-    /// Get a small buffer from the pool or allocate a new one
-    pub fn get_small(&self) -> PooledSmallBuffer {
+    /// Get a small buffer from the pool or allocate a new one.
+    pub fn get_small(self: &Arc<Self>) -> PooledSmallBuffer {
         let buf = self
             .small_buffers
             .lock()
             .pop()
             .unwrap_or_else(|| Box::new([0u8; WG_BUFFER_SIZE]));
-        PooledSmallBuffer { buf }
+        PooledSmallBuffer {
+            pool: Arc::clone(self),
+            buf: Some(buf),
+        }
     }
 
-    /// Get a large buffer from the pool or allocate a new one
-    pub fn get_large(&self) -> PooledLargeBuffer {
+    /// Get a large buffer from the pool or allocate a new one.
+    pub fn get_large(self: &Arc<Self>) -> PooledLargeBuffer {
         let buf = self
             .large_buffers
             .lock()
             .pop()
             .unwrap_or_else(|| Box::new([0u8; TCP_BUFFER_SIZE]));
-        PooledLargeBuffer { buf }
+        PooledLargeBuffer {
+            pool: Arc::clone(self),
+            buf: Some(buf),
+        }
     }
 
-    /// Return a small buffer to the pool
-    #[allow(dead_code)]
-    pub fn return_small(&self, mut buf: Box<[u8; WG_BUFFER_SIZE]>) {
+    fn put_small(&self, mut buf: Box<[u8; WG_BUFFER_SIZE]>) {
         let mut pool = self.small_buffers.lock();
         if pool.len() < self.max_small {
+            // Avoid clearing in release builds; hot paths fully overwrite used ranges.
+            #[cfg(debug_assertions)]
             buf.fill(0);
             pool.push(buf);
         }
     }
 
-    /// Return a large buffer to the pool
-    #[allow(dead_code)]
-    pub fn return_large(&self, mut buf: Box<[u8; TCP_BUFFER_SIZE]>) {
+    fn put_large(&self, mut buf: Box<[u8; TCP_BUFFER_SIZE]>) {
         let mut pool = self.large_buffers.lock();
         if pool.len() < self.max_large {
+            #[cfg(debug_assertions)]
             buf.fill(0);
             pool.push(buf);
         }
@@ -75,38 +85,66 @@ impl Default for BufferPool {
     }
 }
 
-/// A small pooled buffer (WG_BUFFER_SIZE)
+/// A small pooled buffer (WG_BUFFER_SIZE).
 pub struct PooledSmallBuffer {
-    pub buf: Box<[u8; WG_BUFFER_SIZE]>,
+    pool: Arc<BufferPool>,
+    buf: Option<Box<[u8; WG_BUFFER_SIZE]>>,
 }
 
-impl std::ops::Deref for PooledSmallBuffer {
+impl Deref for PooledSmallBuffer {
     type Target = [u8; WG_BUFFER_SIZE];
+
     fn deref(&self) -> &Self::Target {
-        &self.buf
+        self.buf
+            .as_deref()
+            .expect("pooled small buffer already returned")
     }
 }
 
-impl std::ops::DerefMut for PooledSmallBuffer {
+impl DerefMut for PooledSmallBuffer {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.buf
+        self.buf
+            .as_deref_mut()
+            .expect("pooled small buffer already returned")
     }
 }
 
-/// A large pooled buffer (TCP_BUFFER_SIZE)
+impl Drop for PooledSmallBuffer {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            self.pool.put_small(buf);
+        }
+    }
+}
+
+/// A large pooled buffer (TCP_BUFFER_SIZE).
 pub struct PooledLargeBuffer {
-    pub buf: Box<[u8; TCP_BUFFER_SIZE]>,
+    pool: Arc<BufferPool>,
+    buf: Option<Box<[u8; TCP_BUFFER_SIZE]>>,
 }
 
-impl std::ops::Deref for PooledLargeBuffer {
+impl Deref for PooledLargeBuffer {
     type Target = [u8; TCP_BUFFER_SIZE];
+
     fn deref(&self) -> &Self::Target {
-        &self.buf
+        self.buf
+            .as_deref()
+            .expect("pooled large buffer already returned")
     }
 }
 
-impl std::ops::DerefMut for PooledLargeBuffer {
+impl DerefMut for PooledLargeBuffer {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.buf
+        self.buf
+            .as_deref_mut()
+            .expect("pooled large buffer already returned")
+    }
+}
+
+impl Drop for PooledLargeBuffer {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            self.pool.put_large(buf);
+        }
     }
 }

@@ -11,7 +11,6 @@ use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use boringtun::device::allowed_ips::AllowedIps;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
-use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use rand::RngCore;
 use smoltcp::phy::ChecksumCapabilities;
@@ -22,6 +21,9 @@ use smoltcp::wire::{
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
+
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 
@@ -32,17 +34,18 @@ use crate::netstack::Netstack;
 const TIMER_INTERVAL: Duration = Duration::from_millis(100);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const TCP_RX_BUFFER: usize = 64 * 1024;
-const TCP_TX_BUFFER: usize = 64 * 1024;
+const TCP_RX_BUFFER: usize = 512 * 1024;
+const TCP_TX_BUFFER: usize = 512 * 1024;
 const UDP_RX_BUFFER: usize = 2048;
 const UDP_TX_BUFFER: usize = 2048;
 const ICMP_RX_BUFFER: usize = 256;
 const ICMP_TX_BUFFER: usize = 256;
 
-/// Outbound datagram for UDP sending (zero-copy with Bytes)
-pub struct Datagram {
-    pub endpoint: SocketAddr,
-    pub data: Bytes,
+/// Outbound datagram for UDP sending.
+struct Datagram {
+    endpoint: SocketAddr,
+    buf: crate::buffer::PooledSmallBuffer,
+    len: usize,
 }
 
 #[derive(Clone)]
@@ -113,7 +116,7 @@ pub struct WgTcpListener {
 impl WireguardRuntime {
     pub async fn new(config: &DeviceConfig) -> anyhow::Result<Self> {
         let mtu = config.mtu;
-        let netstack = Netstack::new(&config.addresses, mtu);
+
         let udp = Arc::new(bind_udp_socket(config.listen_port).context("bind udp socket")?);
 
         let mut peers = Vec::new();
@@ -144,6 +147,8 @@ impl WireguardRuntime {
 
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         let buffer_pool = Arc::new(BufferPool::new(128, 64));
+
+        let netstack = Netstack::new(&config.addresses, mtu, Arc::clone(&buffer_pool));
 
         let inner = Arc::new(Inner {
             netstack: Mutex::new(netstack),
@@ -532,30 +537,126 @@ impl WireguardRuntime {
     }
 
     async fn udp_loop(&self) {
-        let mut buffer = self.inner.buffer_pool.get_large();
-        loop {
-            let (len, src) = match self.inner.udp.recv_from(&mut buffer.buf[..]).await {
-                Ok(result) => result,
-                Err(err) => {
-                    log::error!("udp recv error: {err}");
-                    continue;
-                }
-            };
+        // Receive WireGuard UDP packets. On Linux, use recvmmsg to amortize syscall costs.
+        #[cfg(target_os = "linux")]
+        {
+            use std::io;
+            use std::io::IoSliceMut;
+            use tokio::io::Interest;
 
-            if let Err(err) = self.handle_incoming(src, &buffer.buf[..len]) {
-                log::error!("failed handling udp packet: {err:#}");
+            use nix::sys::socket::{MsgFlags, MultiHeaders, SockaddrStorage, recvmmsg};
+
+            const BATCH_SIZE: usize = 32;
+
+            let fd = self.inner.udp.as_raw_fd();
+
+            // Preallocate buffers + headers once and reuse.
+            //
+            // We keep the backing buffers alive for the full lifetime of this loop and
+            // (re)construct IoSliceMut values on demand.
+            let mut bufs: Vec<Box<[u8; crate::buffer::WG_BUFFER_SIZE]>> = (0..BATCH_SIZE)
+                .map(|_| Box::new([0u8; crate::buffer::WG_BUFFER_SIZE]))
+                .collect();
+            let buf_ptrs: Vec<*mut u8> = bufs.iter_mut().map(|b| b.as_mut_ptr()).collect();
+
+            let mut headers: MultiHeaders<SockaddrStorage> =
+                MultiHeaders::preallocate(BATCH_SIZE, None);
+
+            loop {
+                // Wait until the socket is readable, then perform the batch recv.
+                let res = self.inner.udp.try_io(Interest::READABLE, || {
+                    // Rebuild IoSliceMut wrappers for recvmmsg.
+                    let mut iovecs: Vec<[IoSliceMut<'_>; 1]> = Vec::with_capacity(BATCH_SIZE);
+                    for &ptr in &buf_ptrs {
+                        // SAFETY: ptr points into `bufs`, which outlives this closure.
+                        let slice = unsafe {
+                            std::slice::from_raw_parts_mut(ptr, crate::buffer::WG_BUFFER_SIZE)
+                        };
+                        iovecs.push([IoSliceMut::new(slice)]);
+                    }
+
+                    let mut results = recvmmsg(
+                        fd,
+                        &mut headers,
+                        iovecs.iter_mut(),
+                        MsgFlags::MSG_DONTWAIT,
+                        None,
+                    )
+                    .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+
+                    // Preserve the recvmmsg order so idx aligns with bufs[idx].
+                    let mut out: Vec<(usize, std::net::SocketAddr)> =
+                        Vec::with_capacity(BATCH_SIZE);
+                    for msg in &mut results {
+                        let Some(addr) = msg.address else {
+                            continue;
+                        };
+                        let addr = match addr.family() {
+                            Some(nix::sys::socket::AddressFamily::Inet) => {
+                                std::net::SocketAddr::from(*addr.as_sockaddr_in().unwrap())
+                            }
+                            Some(nix::sys::socket::AddressFamily::Inet6) => {
+                                std::net::SocketAddr::from(*addr.as_sockaddr_in6().unwrap())
+                            }
+                            _ => continue,
+                        };
+                        out.push((msg.bytes, addr));
+                    }
+                    Ok(out)
+                });
+
+                match res {
+                    Ok(batch) => {
+                        for (idx, (len, src)) in batch.into_iter().enumerate() {
+                            if len == 0 {
+                                continue;
+                            }
+                            // Each iovec points into the corresponding bufs[idx] buffer.
+                            if let Some(buf) = bufs.get(idx) {
+                                if let Err(err) = self.handle_incoming(src, &buf[..len]) {
+                                    log::error!("failed handling udp packet: {err:#}");
+                                }
+                            }
+                        }
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        // Readiness was false-positive; loop and await again.
+                        continue;
+                    }
+                    Err(err) => {
+                        log::error!("udp recv error: {err}");
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut buffer = self.inner.buffer_pool.get_large();
+            loop {
+                let (len, src) = match self.inner.udp.recv_from(&mut buffer[..]).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        log::error!("udp recv error: {err}");
+                        continue;
+                    }
+                };
+
+                if let Err(err) = self.handle_incoming(src, &buffer[..len]) {
+                    log::error!("failed handling udp packet: {err:#}");
+                }
             }
         }
     }
 
     async fn timer_loop(&self) {
-        let mut timer_buf = [0u8; 256];
-
         loop {
             {
                 let mut peers = self.inner.peers.write();
                 for peer in &mut peers.peers {
-                    match peer.tunn.update_timers(&mut timer_buf) {
+                    // Allocate an output buffer from the pool and let boringtun write into it.
+                    let mut out = self.inner.buffer_pool.get_small();
+                    match peer.tunn.update_timers(&mut out[..]) {
                         TunnResult::WriteToNetwork(packet) => {
                             let msg_type = if packet.len() >= 148 {
                                 "Sending handshake initiation"
@@ -563,9 +664,11 @@ impl WireguardRuntime {
                                 "Sending keepalive packet"
                             };
                             log::debug!("peer{} - {}", peer.short_id(), msg_type);
+                            let len = packet.len();
                             let _ = self.inner.outbound_tx.send(Datagram {
                                 endpoint: peer.endpoint,
-                                data: Bytes::copy_from_slice(packet),
+                                buf: out,
+                                len,
                             });
                         }
                         TunnResult::Err(err) => {
@@ -580,12 +683,12 @@ impl WireguardRuntime {
         }
     }
 
-    fn send_frames(&self, frames: Vec<Vec<u8>>) {
+    fn send_frames(&self, frames: Vec<crate::netstack::PacketBuf>) {
         let mut peers = self.inner.peers.write();
-        let mut buf = self.inner.buffer_pool.get_small();
 
         for frame in frames {
-            let dst = match dst_ip(&frame) {
+            let frame_bytes = frame.as_slice();
+            let dst = match dst_ip(frame_bytes) {
                 Some(dst) => dst,
                 None => {
                     log::warn!("dropping packet without destination");
@@ -596,12 +699,17 @@ impl WireguardRuntime {
                 log::warn!("no peer for destination {dst}");
                 continue;
             };
+
+            // Allocate a fresh output buffer and let boringtun write into it.
+            let mut out = self.inner.buffer_pool.get_small();
             let peer = &mut peers.peers[peer_idx];
-            match peer.tunn.encapsulate(&frame, &mut buf.buf[..]) {
+            match peer.tunn.encapsulate(frame_bytes, &mut out[..]) {
                 TunnResult::WriteToNetwork(packet) => {
+                    let len = packet.len();
                     let _ = self.inner.outbound_tx.send(Datagram {
                         endpoint: peer.endpoint,
-                        data: Bytes::copy_from_slice(packet),
+                        buf: out,
+                        len,
                     });
                 }
                 TunnResult::Err(err) => {
@@ -614,7 +722,6 @@ impl WireguardRuntime {
 
     /// Handle incoming UDP packet from WireGuard peer
     fn handle_incoming(&self, src: SocketAddr, data: &[u8]) -> anyhow::Result<()> {
-        let mut buf = self.inner.buffer_pool.get_small();
         let mut inbound_packets = Vec::new();
 
         {
@@ -625,9 +732,9 @@ impl WireguardRuntime {
                     peer,
                     src.ip(),
                     data,
-                    &mut buf.buf[..],
                     &self.inner.outbound_tx,
                     &mut inbound_packets,
+                    &self.inner.buffer_pool,
                 );
             } else {
                 for peer in &mut peers.peers {
@@ -635,9 +742,9 @@ impl WireguardRuntime {
                         peer,
                         src.ip(),
                         data,
-                        &mut buf.buf[..],
                         &self.inner.outbound_tx,
                         &mut inbound_packets,
+                        &self.inner.buffer_pool,
                     );
                     if handled {
                         break;
@@ -794,7 +901,7 @@ async fn outbound_sender_loop(udp: Arc<UdpSocket>, mut rx: mpsc::UnboundedReceiv
 
             if batch.len() == 1 {
                 let dg = &batch[0];
-                if let Err(e) = udp.send_to(&dg.data, dg.endpoint).await {
+                if let Err(e) = udp.send_to(&dg.buf[..dg.len], dg.endpoint).await {
                     log::error!("udp send error: {e}");
                 }
             } else {
@@ -809,7 +916,7 @@ async fn outbound_sender_loop(udp: Arc<UdpSocket>, mut rx: mpsc::UnboundedReceiv
     #[cfg(not(target_os = "linux"))]
     {
         while let Some(dg) = rx.recv().await {
-            if let Err(e) = udp.send_to(&dg.data, dg.endpoint).await {
+            if let Err(e) = udp.send_to(&dg.buf[..dg.len], dg.endpoint).await {
                 log::error!("udp send error: {e}");
             }
         }
@@ -822,19 +929,18 @@ fn send_batch_linux(fd: std::os::fd::RawFd, batch: &[Datagram]) -> anyhow::Resul
     use nix::sys::socket::{MsgFlags, MultiHeaders, SockaddrStorage, sendmmsg};
     use std::io::IoSlice;
 
+    // Build slices/addresses without reallocating on each call.
     let mut iovecs: Vec<[IoSlice<'_>; 1]> = Vec::with_capacity(batch.len());
     let mut addrs: Vec<Option<SockaddrStorage>> = Vec::with_capacity(batch.len());
 
-    // Prepare addresses and iovecs
     for dg in batch {
-        let addr: SockaddrStorage = dg.endpoint.into();
-        addrs.push(Some(addr));
-        iovecs.push([IoSlice::new(&dg.data)]);
+        addrs.push(Some(dg.endpoint.into()));
+        iovecs.push([IoSlice::new(&dg.buf[..dg.len])]);
     }
 
-    // nix 0.30 sendmmsg requires MultiHeaders preallocated buffer
+    // nix sendmmsg requires a preallocated MultiHeaders.
     let mut data: MultiHeaders<SockaddrStorage> = MultiHeaders::preallocate(batch.len(), None);
-    let cmsgs: Vec<nix::sys::socket::ControlMessage<'_>> = vec![];
+    let cmsgs: [nix::sys::socket::ControlMessage<'_>; 0] = [];
 
     sendmmsg(fd, &mut data, &iovecs, &addrs, &cmsgs, MsgFlags::empty())?;
     Ok(())
@@ -941,50 +1047,51 @@ fn process_datagram(
     peer: &mut PeerState,
     src_ip: IpAddr,
     data: &[u8],
-    out_buf: &mut [u8],
     outbound_tx: &mpsc::UnboundedSender<Datagram>,
-    inbound: &mut Vec<Vec<u8>>,
+    inbound: &mut Vec<crate::netstack::PacketBuf>,
+    buffer_pool: &Arc<BufferPool>,
 ) -> bool {
-    let mut handled = false;
     let peer_id = peer.short_id();
-    let mut result = peer.tunn.decapsulate(Some(src_ip), data, out_buf);
+
+    // `decapsulate` writes into our buffer and returns slices that borrow from it.
+    // Keep `out_buf` alive for the duration of this function.
+    let mut out_buf = buffer_pool.get_small();
+    let mut result = peer.tunn.decapsulate(Some(src_ip), data, &mut out_buf[..]);
     loop {
         match result {
             TunnResult::WriteToNetwork(packet) => {
                 log::debug!("peer{} - Received handshake response", peer_id);
+                let mut out = buffer_pool.get_small();
+                let len = packet.len();
+                out[..len].copy_from_slice(packet);
                 let _ = outbound_tx.send(Datagram {
                     endpoint: peer.endpoint,
-                    data: Bytes::copy_from_slice(packet),
+                    buf: out,
+                    len,
                 });
-                handled = true;
-                result = peer.tunn.decapsulate(Some(src_ip), &[], out_buf);
+                result = peer.tunn.decapsulate(Some(src_ip), &[], &mut out_buf[..]);
             }
-            TunnResult::WriteToTunnelV4(packet, _) => {
-                log::trace!("peer{} - received {} bytes (IPv4)", peer_id, packet.len());
-                inbound.push(packet.to_vec());
-                handled = true;
-                break;
-            }
-            TunnResult::WriteToTunnelV6(packet, _) => {
-                log::trace!("peer{} - received {} bytes (IPv6)", peer_id, packet.len());
-                inbound.push(packet.to_vec());
-                handled = true;
-                break;
+            TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                // `packet` borrows from our `out_buf`.
+                let len = packet.len();
+                log::trace!("peer{} - received {} bytes (IP)", peer_id, len);
+
+                // Zero-copy: move the decapsulation buffer directly into the netstack queue.
+                inbound.push(crate::netstack::PacketBuf::new(out_buf, len));
+                return true;
             }
             TunnResult::Done => {
                 if !data.is_empty() && data.len() < 100 {
                     log::debug!("peer{} - Receiving keepalive packet", peer_id);
                 }
-                handled = true;
-                break;
+                return true;
             }
             TunnResult::Err(err) => {
                 log::debug!("peer{} - decapsulate error: {err:?}", peer_id);
-                break;
+                return false;
             }
         }
     }
-    handled
 }
 
 fn random_ephemeral_port() -> u16 {
