@@ -18,8 +18,10 @@ pub struct BufferPool {
     #[allow(clippy::vec_box)]
     small_buffers: Mutex<Vec<Box<[u8; WG_BUFFER_SIZE]>>>,
     #[allow(clippy::vec_box)]
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     large_buffers: Mutex<Vec<Box<[u8; TCP_BUFFER_SIZE]>>>,
     max_small: usize,
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     max_large: usize,
 }
 
@@ -47,6 +49,7 @@ impl BufferPool {
     }
 
     /// Get a large buffer from the pool or allocate a new one.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn get_large(self: &Arc<Self>) -> PooledLargeBuffer {
         let buf = self
             .large_buffers
@@ -71,6 +74,7 @@ impl BufferPool {
         }
     }
 
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     fn put_large(&self, buf: Box<[u8; TCP_BUFFER_SIZE]>) {
         let mut pool = self.large_buffers.lock();
         if pool.len() < self.max_large {
@@ -122,6 +126,7 @@ impl Drop for PooledSmallBuffer {
 }
 
 /// A large pooled buffer (TCP_BUFFER_SIZE).
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub struct PooledLargeBuffer {
     pool: Arc<BufferPool>,
     buf: Option<Box<[u8; TCP_BUFFER_SIZE]>>,

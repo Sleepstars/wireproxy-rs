@@ -17,6 +17,16 @@ fn get_test_config() -> Option<PathBuf> {
         .filter(|p| p.exists())
 }
 
+fn require_test_config() -> PathBuf {
+    match get_test_config() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping E2E test: set WIREPROXY_TEST_CONFIG to an existing config file");
+            std::process::exit(0);
+        }
+    }
+}
+
 struct WireproxyProcess(Child);
 
 impl Drop for WireproxyProcess {
@@ -41,14 +51,14 @@ fn start_wireproxy(config: &PathBuf) -> WireproxyProcess {
 #[tokio::test]
 #[ignore = "requires WIREPROXY_TEST_CONFIG"]
 async fn test_config_loads_successfully() {
-    let config = get_test_config().expect("WIREPROXY_TEST_CONFIG not set");
+    let config = require_test_config();
     assert!(config.exists());
 }
 
 #[tokio::test]
 #[ignore = "requires WIREPROXY_TEST_CONFIG"]
 async fn test_socks5_proxy_connects() {
-    let config = get_test_config().expect("WIREPROXY_TEST_CONFIG not set");
+    let config = require_test_config();
     let _proc = start_wireproxy(&config);
 
     let result = timeout(Duration::from_secs(5), TcpStream::connect("127.0.0.1:1080")).await;
@@ -59,7 +69,7 @@ async fn test_socks5_proxy_connects() {
 #[tokio::test]
 #[ignore = "requires WIREPROXY_TEST_CONFIG"]
 async fn test_http_proxy_connects() {
-    let config = get_test_config().expect("WIREPROXY_TEST_CONFIG not set");
+    let config = require_test_config();
     let _proc = start_wireproxy(&config);
 
     let result = timeout(Duration::from_secs(5), TcpStream::connect("127.0.0.1:8080")).await;
@@ -70,7 +80,7 @@ async fn test_http_proxy_connects() {
 #[tokio::test]
 #[ignore = "requires WIREPROXY_TEST_CONFIG"]
 async fn test_socks5_handshake() {
-    let config = get_test_config().expect("WIREPROXY_TEST_CONFIG not set");
+    let config = require_test_config();
     let _proc = start_wireproxy(&config);
 
     let mut stream = timeout(Duration::from_secs(5), TcpStream::connect("127.0.0.1:1080"))

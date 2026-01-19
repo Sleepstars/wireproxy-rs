@@ -714,7 +714,13 @@ impl WireguardRuntime {
                 MultiHeaders::preallocate(BATCH_SIZE, None);
 
             loop {
-                // Wait until the socket is readable, then perform the batch recv.
+                // IMPORTANT: don't spin on `try_io` when the socket isn't ready.
+                // `readable().await` yields until the runtime observes readiness.
+                if let Err(err) = self.inner.udp.readable().await {
+                    log::error!("udp readiness error: {err}");
+                    continue;
+                }
+
                 let res = self.inner.udp.try_io(Interest::READABLE, || {
                     // Rebuild IoSliceMut wrappers for recvmmsg.
                     let mut iovecs: Vec<[IoSliceMut<'_>; 1]> = Vec::with_capacity(BATCH_SIZE);
@@ -776,7 +782,7 @@ impl WireguardRuntime {
                 match res {
                     Ok(()) => {}
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        // Readiness was false-positive; loop and await again.
+                        // Readiness was false-positive; go back to `readable().await`.
                         continue;
                     }
                     Err(err) => {
@@ -1183,9 +1189,13 @@ fn process_datagram(
         .lock()
         .decapsulate(Some(src.ip()), data, &mut out_buf[..]);
 
+    let mut flush = false;
+
     loop {
         match result {
             TunnResult::WriteToNetwork(packet) => {
+                flush = true;
+
                 // Handshake response / keepalive etc.
                 // `packet` borrows from `out_buf`, so we can send `out_buf` directly.
                 let len = packet.len();
@@ -1197,16 +1207,33 @@ fn process_datagram(
 
                 // Prepare a new buffer for any subsequent `WriteToNetwork`/`WriteToTunnel*` results.
                 out_buf = buffer_pool.get_small();
-                result = peer
-                    .lock()
-                    .decapsulate(Some(src.ip()), &[], &mut out_buf[..]);
+                result = peer.lock().decapsulate(None, &[], &mut out_buf[..]);
             }
             TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
                 let len = packet.len();
                 inbound.push(crate::netstack::PacketBuf::new(out_buf, len));
+
+                // Flush pending queue after processing a packet that generated output.
+                if flush {
+                    out_buf = buffer_pool.get_small();
+                    result = peer.lock().decapsulate(None, &[], &mut out_buf[..]);
+                    flush = false;
+                    continue;
+                }
+
                 return true;
             }
-            TunnResult::Done => return true,
+            TunnResult::Done => {
+                // Flush pending queue after a packet that generated output.
+                if flush {
+                    out_buf = buffer_pool.get_small();
+                    result = peer.lock().decapsulate(None, &[], &mut out_buf[..]);
+                    flush = false;
+                    continue;
+                }
+
+                return true;
+            }
             TunnResult::Err(_) => return false,
         }
     }
