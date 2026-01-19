@@ -728,7 +728,7 @@ impl WireguardRuntime {
                             iovecs.push([IoSliceMut::new(&mut buf[..])]);
                         }
 
-                        let mut results = recvmmsg(
+                        let results = recvmmsg(
                             fd,
                             &mut headers,
                             iovecs.iter_mut(),
@@ -737,16 +737,8 @@ impl WireguardRuntime {
                         )
                         .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
 
-                        // Release the mutable borrows from `iovecs` before accessing `bufs` again.
-                        drop(iovecs);
-
-                        // `recvmmsg` returns results in the same order as the provided iovecs.
-                        for (idx, msg) in results.iter_mut().enumerate() {
-                            let buf = match bufs.get(idx) {
-                                Some(b) => b,
-                                None => break,
-                            };
-
+                        // `recvmmsg` yields `RecvMsg` values, each with a single iovec.
+                        for msg in results {
                             let len = msg.bytes;
                             if len == 0 {
                                 continue;
@@ -765,8 +757,11 @@ impl WireguardRuntime {
                                 _ => continue,
                             };
 
-                            // Each iovec points into the corresponding `bufs[idx]` buffer.
-                            if let Err(err) = self.handle_incoming(src, &buf[..len]) {
+                            let Some(data) = msg.iovs().next() else {
+                                continue;
+                            };
+
+                            if let Err(err) = self.handle_incoming(src, data) {
                                 log::error!("failed handling udp packet: {err:#}");
                             }
                         }
