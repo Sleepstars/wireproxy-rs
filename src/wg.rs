@@ -64,10 +64,9 @@ fn spawn_decryption_workers(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<E
                     }
 
                     if !inbound_packets.is_empty() {
-                        let mut netstack = inner.netstack.lock();
-                        for packet in inbound_packets {
-                            netstack.push_inbound(packet);
-                        }
+                        // Hand packets off to the poll loop to avoid blocking crypto workers
+                        // on the netstack lock.
+                        let _ = inner.inbound_tx.send(inbound_packets);
                     }
 
                     inner.poll_notify.notify_one();
@@ -97,10 +96,9 @@ fn spawn_decryption_workers(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<E
                 }
 
                 if !inbound_packets.is_empty() {
-                    let mut netstack = inner.netstack.lock();
-                    for packet in inbound_packets {
-                        netstack.push_inbound(packet);
-                    }
+                    // Hand packets off to the poll loop to avoid blocking crypto workers
+                    // on the netstack lock.
+                    let _ = inner.inbound_tx.send(inbound_packets);
                 }
 
                 inner.poll_notify.notify_one();
@@ -226,6 +224,10 @@ struct Inner {
     decrypt_tx: mpsc::UnboundedSender<EncryptedDatagram>,
     /// Plain IP packets from the netstack that should be encapsulated.
     encrypt_tx: mpsc::UnboundedSender<OutboundPacket>,
+    /// Decrypted IP packets produced by crypto workers.
+    inbound_tx: mpsc::UnboundedSender<Vec<crate::netstack::PacketBuf>>,
+    /// Receive side of `inbound_tx`.
+    inbound_rx: Mutex<mpsc::UnboundedReceiver<Vec<crate::netstack::PacketBuf>>>,
     /// Wakes the smoltcp poll loop when new work arrives.
     poll_notify: Notify,
     /// Wakes tasks waiting on socket readiness/state changes.
@@ -314,6 +316,7 @@ impl WireguardRuntime {
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         let (decrypt_tx, decrypt_rx) = mpsc::unbounded_channel();
         let (encrypt_tx, encrypt_rx) = mpsc::unbounded_channel();
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
 
         let buffer_pool = Arc::new(BufferPool::new(128, 64));
 
@@ -326,6 +329,8 @@ impl WireguardRuntime {
             outbound_tx,
             decrypt_tx,
             encrypt_tx,
+            inbound_tx,
+            inbound_rx: Mutex::new(inbound_rx),
             poll_notify: Notify::new(),
             io_notify: Notify::new(),
             started: AtomicBool::new(false),
@@ -659,8 +664,20 @@ impl WireguardRuntime {
     /// Event-driven poll loop - wakes on notify or timeout
     async fn poll_loop(&self) {
         loop {
+            // Drain decrypted packets from crypto workers, then run one poll step.
             let (frames, did_work, delay) = {
                 let mut netstack = self.inner.netstack.lock();
+
+                // Move decrypted IP packets into smoltcp's RX queue.
+                // This keeps crypto workers off the netstack lock and reduces contention.
+                if let Some(mut rx) = self.inner.inbound_rx.try_lock() {
+                    while let Ok(batch) = rx.try_recv() {
+                        for packet in batch {
+                            netstack.push_inbound(packet);
+                        }
+                    }
+                }
+
                 let did_work = netstack.poll();
                 let frames = netstack.drain_outbound();
                 let delay = netstack.poll_delay();
@@ -1077,7 +1094,7 @@ fn send_batch_linux(fd: std::os::fd::RawFd, batch: &[Datagram]) -> anyhow::Resul
     let mut data: MultiHeaders<SockaddrStorage> = MultiHeaders::preallocate(batch.len(), None);
     let cmsgs: [nix::sys::socket::ControlMessage<'_>; 0] = [];
 
-    sendmmsg(fd, &mut data, &iovecs, &addrs, &cmsgs, MsgFlags::empty())?;
+    sendmmsg(fd, &mut data, &iovecs, &addrs, cmsgs, MsgFlags::empty())?;
     Ok(())
 }
 
@@ -1106,8 +1123,14 @@ fn build_tunn(device: &DeviceConfig, peer: &PeerConfig) -> anyhow::Result<Tunn> 
         Some(peer.keepalive)
     };
     let index: u32 = rand::random();
-    Tunn::new(private_key, peer_public, preshared, keepalive, index, None)
-        .map_err(|err| anyhow::anyhow!(err))
+    Ok(Tunn::new(
+        private_key,
+        peer_public,
+        preshared,
+        keepalive,
+        index,
+        None,
+    ))
 }
 
 fn encode_key(key: &[u8; 32]) -> String {
