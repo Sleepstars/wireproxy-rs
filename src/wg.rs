@@ -27,6 +27,152 @@ use std::os::fd::AsRawFd;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 
+fn worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn spawn_decryption_workers(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<EncryptedDatagram>) {
+    let workers = worker_count();
+    let mut worker_txs: Vec<mpsc::UnboundedSender<EncryptedDatagram>> = Vec::with_capacity(workers);
+
+    for _ in 0..workers {
+        let (tx, mut worker_rx) = mpsc::unbounded_channel();
+        worker_txs.push(tx);
+
+        let inner = Arc::clone(&inner);
+        tokio::spawn(async move {
+            while let Some(dg) = worker_rx.recv().await {
+                // If we know which peer this belongs to (endpoint match), avoid scanning.
+                if let Some(peer_idx) = dg.peer_idx {
+                    let mut inbound_packets = Vec::new();
+                    {
+                        let peer = {
+                            let peers = inner.peers.read();
+                            Arc::clone(&peers.peers[peer_idx].tunn)
+                        };
+                        process_datagram(
+                            &peer,
+                            dg.src,
+                            &dg.buf[..dg.len],
+                            &inner.outbound_tx,
+                            &mut inbound_packets,
+                            &inner.buffer_pool,
+                        );
+                    }
+
+                    if !inbound_packets.is_empty() {
+                        let mut netstack = inner.netstack.lock();
+                        for packet in inbound_packets {
+                            netstack.push_inbound(packet);
+                        }
+                    }
+
+                    inner.notify.notify_waiters();
+                    continue;
+                }
+
+                // Otherwise, try each peer (slow path; should be rare if endpoints are stable).
+                // Snapshot the tunnels so we don't hold the peers lock while attempting decapsulation.
+                let peers: Vec<Arc<Mutex<Tunn>>> = {
+                    let peers = inner.peers.read();
+                    peers.peers.iter().map(|p| Arc::clone(&p.tunn)).collect()
+                };
+
+                let mut inbound_packets = Vec::new();
+                for peer in peers {
+                    let handled = process_datagram(
+                        &peer,
+                        dg.src,
+                        &dg.buf[..dg.len],
+                        &inner.outbound_tx,
+                        &mut inbound_packets,
+                        &inner.buffer_pool,
+                    );
+                    if handled {
+                        break;
+                    }
+                }
+
+                if !inbound_packets.is_empty() {
+                    let mut netstack = inner.netstack.lock();
+                    for packet in inbound_packets {
+                        netstack.push_inbound(packet);
+                    }
+                }
+
+                inner.notify.notify_waiters();
+            }
+        });
+    }
+
+    tokio::spawn(async move {
+        let mut next = 0usize;
+        while let Some(dg) = rx.recv().await {
+            if worker_txs.is_empty() {
+                break;
+            }
+            let idx = next % worker_txs.len();
+            next = next.wrapping_add(1);
+            let _ = worker_txs[idx].send(dg);
+        }
+    });
+}
+
+fn spawn_encryption_workers(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<OutboundPacket>) {
+    let workers = worker_count();
+    let mut worker_txs: Vec<mpsc::UnboundedSender<OutboundPacket>> = Vec::with_capacity(workers);
+
+    for _ in 0..workers {
+        let (tx, mut worker_rx) = mpsc::unbounded_channel();
+        worker_txs.push(tx);
+
+        let inner = Arc::clone(&inner);
+        tokio::spawn(async move {
+            while let Some(job) = worker_rx.recv().await {
+                let mut out = inner.buffer_pool.get_small();
+
+                let (endpoint, tunn) = {
+                    let peers = inner.peers.read();
+                    let peer = &peers.peers[job.peer_idx];
+                    (peer.endpoint, Arc::clone(&peer.tunn))
+                };
+
+                match tunn.lock().encapsulate(job.packet.as_slice(), &mut out[..]) {
+                    TunnResult::WriteToNetwork(packet) => {
+                        let len = packet.len();
+                        let _ = inner.outbound_tx.send(Datagram {
+                            endpoint,
+                            buf: out,
+                            len,
+                        });
+                    }
+                    // If there is no session, boringtun may ask us to send a handshake initiation.
+                    // Those are also `WriteToNetwork` and handled above.
+                    TunnResult::Err(err) => {
+                        log::warn!("wireguard encapsulate error: {err:?}");
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    tokio::spawn(async move {
+        let mut next = 0usize;
+        while let Some(job) = rx.recv().await {
+            if worker_txs.is_empty() {
+                break;
+            }
+            let idx = next % worker_txs.len();
+            next = next.wrapping_add(1);
+            let _ = worker_txs[idx].send(job);
+        }
+    });
+}
+
 use crate::buffer::BufferPool;
 use crate::config::{DeviceConfig, PeerConfig};
 use crate::netstack::Netstack;
@@ -48,6 +194,20 @@ struct Datagram {
     len: usize,
 }
 
+/// Encrypted WireGuard UDP datagram received from the network.
+struct EncryptedDatagram {
+    src: SocketAddr,
+    peer_idx: Option<usize>,
+    buf: crate::buffer::PooledSmallBuffer,
+    len: usize,
+}
+
+/// Outbound (plain) IP packet that should be encapsulated for a specific peer.
+struct OutboundPacket {
+    peer_idx: usize,
+    packet: crate::netstack::PacketBuf,
+}
+
 #[derive(Clone)]
 pub struct WireguardRuntime {
     inner: Arc<Inner>,
@@ -62,6 +222,10 @@ struct Inner {
     udp: Arc<UdpSocket>,
     /// Channel for outbound datagrams (event-driven)
     outbound_tx: mpsc::UnboundedSender<Datagram>,
+    /// Encrypted packets from the UDP socket to be decrypted.
+    decrypt_tx: mpsc::UnboundedSender<EncryptedDatagram>,
+    /// Plain IP packets from the netstack that should be encapsulated.
+    encrypt_tx: mpsc::UnboundedSender<OutboundPacket>,
     /// Notify for netstack events
     notify: Notify,
     /// Started flag
@@ -87,7 +251,7 @@ struct PeerManager {
 
 struct PeerState {
     endpoint: SocketAddr,
-    tunn: Tunn,
+    tunn: Arc<Mutex<Tunn>>,
     config: PeerConfig,
 }
 
@@ -127,7 +291,7 @@ impl WireguardRuntime {
             let endpoint = peer
                 .endpoint
                 .ok_or_else(|| anyhow::anyhow!("peer endpoint is required"))?;
-            let tunn = build_tunn(config, peer)?;
+            let tunn = Arc::new(Mutex::new(build_tunn(config, peer)?));
             for net in &peer.allowed_ips {
                 allowed_ips.insert(net.addr(), net.prefix_len() as u32, idx);
             }
@@ -146,6 +310,9 @@ impl WireguardRuntime {
         };
 
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+        let (decrypt_tx, decrypt_rx) = mpsc::unbounded_channel();
+        let (encrypt_tx, encrypt_rx) = mpsc::unbounded_channel();
+
         let buffer_pool = Arc::new(BufferPool::new(128, 64));
 
         let netstack = Netstack::new(&config.addresses, mtu, Arc::clone(&buffer_pool));
@@ -155,6 +322,8 @@ impl WireguardRuntime {
             peers: RwLock::new(peer_manager),
             udp: udp.clone(),
             outbound_tx,
+            decrypt_tx,
+            encrypt_tx,
             notify: Notify::new(),
             started: AtomicBool::new(false),
             dns_servers: config.dns.clone(),
@@ -167,6 +336,10 @@ impl WireguardRuntime {
         // Spawn the event-driven outbound sender task
         let udp_clone = udp.clone();
         tokio::spawn(outbound_sender_loop(udp_clone, outbound_rx));
+
+        // Spawn worker pools.
+        spawn_decryption_workers(Arc::clone(&inner), decrypt_rx);
+        spawn_encryption_workers(Arc::clone(&inner), encrypt_rx);
 
         Ok(WireguardRuntime { inner })
     }
@@ -205,32 +378,8 @@ impl WireguardRuntime {
         }
 
         for peer in &peers.peers {
-            let _ = writeln!(
-                &mut out,
-                "public_key={}",
-                encode_key(&peer.config.public_key)
-            );
-            if peer.config.preshared_key != [0u8; 32] {
-                let _ = writeln!(
-                    &mut out,
-                    "preshared_key={}",
-                    encode_key(&peer.config.preshared_key)
-                );
-            }
-            if peer.config.keepalive != 0 {
-                let _ = writeln!(
-                    &mut out,
-                    "persistent_keepalive_interval={}",
-                    peer.config.keepalive
-                );
-            }
-            if let Some(endpoint) = peer.config.endpoint {
-                let _ = writeln!(&mut out, "endpoint={endpoint}");
-            }
-            for net in &peer.config.allowed_ips {
-                let _ = writeln!(&mut out, "allowed_ip={net}");
-            }
-            let (last_handshake, tx_bytes, rx_bytes, _, _) = peer.tunn.stats();
+            let (last_handshake, tx_bytes, rx_bytes, _, _) = peer.tunn.lock().stats();
+
             if let Some(since) = last_handshake
                 && let Some(when) = SystemTime::now().checked_sub(since)
                 && let Ok(delta) = when.duration_since(UNIX_EPOCH)
@@ -586,14 +735,26 @@ impl WireguardRuntime {
                     )
                     .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
 
-                    // Preserve the recvmmsg order so idx aligns with bufs[idx].
-                    let mut out: Vec<(usize, std::net::SocketAddr)> =
-                        Vec::with_capacity(BATCH_SIZE);
+                    // `recvmmsg` returns results in the same order as the provided iovecs.
+                    // IMPORTANT: even if we skip a message (missing addr / unsupported family),
+                    // we must still advance the index so we don't mis-associate buffers.
+                    let mut idx = 0usize;
                     for msg in &mut results {
+                        let buf = match bufs.get(idx) {
+                            Some(b) => b,
+                            None => break,
+                        };
+                        idx += 1;
+
+                        let len = msg.bytes;
+                        if len == 0 {
+                            continue;
+                        }
+
                         let Some(addr) = msg.address else {
                             continue;
                         };
-                        let addr = match addr.family() {
+                        let src = match addr.family() {
                             Some(nix::sys::socket::AddressFamily::Inet) => {
                                 std::net::SocketAddr::from(*addr.as_sockaddr_in().unwrap())
                             }
@@ -602,25 +763,18 @@ impl WireguardRuntime {
                             }
                             _ => continue,
                         };
-                        out.push((msg.bytes, addr));
+
+                        // Each iovec points into the corresponding bufs[idx] buffer.
+                        if let Err(err) = self.handle_incoming(src, &buf[..len]) {
+                            log::error!("failed handling udp packet: {err:#}");
+                        }
                     }
-                    Ok(out)
+
+                    Ok(())
                 });
 
                 match res {
-                    Ok(batch) => {
-                        for (idx, (len, src)) in batch.into_iter().enumerate() {
-                            if len == 0 {
-                                continue;
-                            }
-                            // Each iovec points into the corresponding bufs[idx] buffer.
-                            if let Some(buf) = bufs.get(idx) {
-                                if let Err(err) = self.handle_incoming(src, &buf[..len]) {
-                                    log::error!("failed handling udp packet: {err:#}");
-                                }
-                            }
-                        }
-                    }
+                    Ok(()) => {}
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         // Readiness was false-positive; loop and await again.
                         continue;
@@ -658,7 +812,7 @@ impl WireguardRuntime {
                 for peer in &mut peers.peers {
                     // Allocate an output buffer from the pool and let boringtun write into it.
                     let mut out = self.inner.buffer_pool.get_small();
-                    match peer.tunn.update_timers(&mut out[..]) {
+                    match peer.tunn.lock().update_timers(&mut out[..]) {
                         TunnResult::WriteToNetwork(packet) => {
                             let msg_type = if packet.len() >= 148 {
                                 "Sending handshake initiation"
@@ -686,7 +840,9 @@ impl WireguardRuntime {
     }
 
     fn send_frames(&self, frames: Vec<crate::netstack::PacketBuf>) {
-        let mut peers = self.inner.peers.write();
+        // Fast path: pick the peer index (allowed IPs) under a read lock,
+        // then queue the actual encryption work to the worker pool.
+        let peers = self.inner.peers.read();
 
         for frame in frames {
             let frame_bytes = frame.as_slice();
@@ -702,68 +858,34 @@ impl WireguardRuntime {
                 continue;
             };
 
-            // Allocate a fresh output buffer and let boringtun write into it.
-            let mut out = self.inner.buffer_pool.get_small();
-            let peer = &mut peers.peers[peer_idx];
-            match peer.tunn.encapsulate(frame_bytes, &mut out[..]) {
-                TunnResult::WriteToNetwork(packet) => {
-                    let len = packet.len();
-                    let _ = self.inner.outbound_tx.send(Datagram {
-                        endpoint: peer.endpoint,
-                        buf: out,
-                        len,
-                    });
-                }
-                TunnResult::Err(err) => {
-                    log::warn!("wireguard encapsulate error: {err:?}");
-                }
-                _ => {}
-            }
+            let _ = self.inner.encrypt_tx.send(OutboundPacket {
+                peer_idx,
+                packet: frame,
+            });
         }
     }
 
     /// Handle incoming UDP packet from WireGuard peer
     fn handle_incoming(&self, src: SocketAddr, data: &[u8]) -> anyhow::Result<()> {
-        let mut inbound_packets = Vec::new();
+        // Determine whether we can route this to a specific peer based on the endpoint.
+        // Even if this is wrong (roaming), the decrypt worker will fall back to scanning.
+        let peer_idx = {
+            let peers = self.inner.peers.read();
+            peers.peer_by_endpoint.get(&src).cloned()
+        };
 
-        {
-            let mut peers = self.inner.peers.write();
-            if let Some(peer_idx) = peers.peer_by_endpoint.get(&src).cloned() {
-                let peer = &mut peers.peers[peer_idx];
-                process_datagram(
-                    peer,
-                    src.ip(),
-                    data,
-                    &self.inner.outbound_tx,
-                    &mut inbound_packets,
-                    &self.inner.buffer_pool,
-                );
-            } else {
-                for peer in &mut peers.peers {
-                    let handled = process_datagram(
-                        peer,
-                        src.ip(),
-                        data,
-                        &self.inner.outbound_tx,
-                        &mut inbound_packets,
-                        &self.inner.buffer_pool,
-                    );
-                    if handled {
-                        break;
-                    }
-                }
-            }
-        }
+        // Own the buffer for the worker; the caller may reuse its receive buffer.
+        let mut buf = self.inner.buffer_pool.get_small();
+        let len = data.len().min(buf.len());
+        buf[..len].copy_from_slice(&data[..len]);
 
-        // Push inbound packets to netstack (separate lock)
-        if !inbound_packets.is_empty() {
-            let mut netstack = self.inner.netstack.lock();
-            for packet in inbound_packets {
-                netstack.push_inbound(packet);
-            }
-        }
+        let _ = self.inner.decrypt_tx.send(EncryptedDatagram {
+            src,
+            peer_idx,
+            buf,
+            len,
+        });
 
-        self.inner.notify.notify_waiters();
         Ok(())
     }
 }
@@ -1046,52 +1168,46 @@ fn matches_echo_reply(
 }
 
 fn process_datagram(
-    peer: &mut PeerState,
-    src_ip: IpAddr,
+    peer: &Arc<Mutex<Tunn>>,
+    src: SocketAddr,
     data: &[u8],
     outbound_tx: &mpsc::UnboundedSender<Datagram>,
     inbound: &mut Vec<crate::netstack::PacketBuf>,
     buffer_pool: &Arc<BufferPool>,
 ) -> bool {
-    let peer_id = peer.short_id();
-
     // `decapsulate` writes into our buffer and returns slices that borrow from it.
-    // Keep `out_buf` alive for the duration of this function.
+    // Keep `out_buf` alive for the duration of this function (until we turn it into PacketBuf).
     let mut out_buf = buffer_pool.get_small();
-    let mut result = peer.tunn.decapsulate(Some(src_ip), data, &mut out_buf[..]);
+
+    let mut result = peer
+        .lock()
+        .decapsulate(Some(src.ip()), data, &mut out_buf[..]);
+
     loop {
         match result {
             TunnResult::WriteToNetwork(packet) => {
-                log::debug!("peer{} - Received handshake response", peer_id);
-                let mut out = buffer_pool.get_small();
+                // Handshake response / keepalive etc.
+                // `packet` borrows from `out_buf`, so we can send `out_buf` directly.
                 let len = packet.len();
-                out[..len].copy_from_slice(packet);
                 let _ = outbound_tx.send(Datagram {
-                    endpoint: peer.endpoint,
-                    buf: out,
+                    endpoint: src,
+                    buf: out_buf,
                     len,
                 });
-                result = peer.tunn.decapsulate(Some(src_ip), &[], &mut out_buf[..]);
+
+                // Prepare a new buffer for any subsequent `WriteToNetwork`/`WriteToTunnel*` results.
+                out_buf = buffer_pool.get_small();
+                result = peer
+                    .lock()
+                    .decapsulate(Some(src.ip()), &[], &mut out_buf[..]);
             }
             TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                // `packet` borrows from our `out_buf`.
                 let len = packet.len();
-                log::trace!("peer{} - received {} bytes (IP)", peer_id, len);
-
-                // Zero-copy: move the decapsulation buffer directly into the netstack queue.
                 inbound.push(crate::netstack::PacketBuf::new(out_buf, len));
                 return true;
             }
-            TunnResult::Done => {
-                if !data.is_empty() && data.len() < 100 {
-                    log::debug!("peer{} - Receiving keepalive packet", peer_id);
-                }
-                return true;
-            }
-            TunnResult::Err(err) => {
-                log::debug!("peer{} - decapsulate error: {err:?}", peer_id);
-                return false;
-            }
+            TunnResult::Done => return true,
+            TunnResult::Err(_) => return false,
         }
     }
 }

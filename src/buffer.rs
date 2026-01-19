@@ -59,19 +59,23 @@ impl BufferPool {
         }
     }
 
-    fn put_small(&self, mut buf: Box<[u8; WG_BUFFER_SIZE]>) {
+    fn put_small(&self, buf: Box<[u8; WG_BUFFER_SIZE]>) {
         let mut pool = self.small_buffers.lock();
         if pool.len() < self.max_small {
             // Avoid clearing in release builds; hot paths fully overwrite used ranges.
+            #[cfg(debug_assertions)]
+            let mut buf = buf;
             #[cfg(debug_assertions)]
             buf.fill(0);
             pool.push(buf);
         }
     }
 
-    fn put_large(&self, mut buf: Box<[u8; TCP_BUFFER_SIZE]>) {
+    fn put_large(&self, buf: Box<[u8; TCP_BUFFER_SIZE]>) {
         let mut pool = self.large_buffers.lock();
         if pool.len() < self.max_large {
+            #[cfg(debug_assertions)]
+            let mut buf = buf;
             #[cfg(debug_assertions)]
             buf.fill(0);
             pool.push(buf);
