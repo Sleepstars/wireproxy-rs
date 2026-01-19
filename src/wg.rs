@@ -544,7 +544,9 @@ impl WireguardRuntime {
             use std::io::IoSliceMut;
             use tokio::io::Interest;
 
-            use nix::sys::socket::{MsgFlags, MultiHeaders, SockaddrStorage, recvmmsg};
+            use nix::sys::socket::{
+                MsgFlags, MultiHeaders, SockaddrLike, SockaddrStorage, recvmmsg,
+            };
 
             const BATCH_SIZE: usize = 32;
 
