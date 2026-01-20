@@ -24,18 +24,27 @@ use tokio::net::UdpSocket;
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-use tokio::sync::{Notify, mpsc};
-use tokio::time::Instant;
+use tokio::sync::{Notify, mpsc, oneshot};
 
-fn worker_count() -> usize {
+fn default_worker_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
         .max(1)
 }
 
+fn runtime_worker_count(config: &DeviceConfig) -> usize {
+    config
+        .worker_threads
+        .unwrap_or_else(default_worker_count)
+        .max(1)
+}
+
 fn spawn_decryption_workers(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<EncryptedDatagram>) {
-    let workers = worker_count();
+    // boringtun's tunnel state is effectively single-threaded per peer; extra workers just add
+    // contention when we only have a small number of peers.
+    let peer_count = inner.peers.read().peers.len().max(1);
+    let workers = runtime_worker_count(&inner.device_config).min(peer_count);
     let mut worker_txs: Vec<mpsc::UnboundedSender<EncryptedDatagram>> = Vec::with_capacity(workers);
 
     for _ in 0..workers {
@@ -120,7 +129,7 @@ fn spawn_decryption_workers(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<E
 }
 
 fn spawn_encryption_workers(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<OutboundPacket>) {
-    let workers = worker_count();
+    let workers = runtime_worker_count(&inner.device_config);
     let mut worker_txs: Vec<mpsc::UnboundedSender<OutboundPacket>> = Vec::with_capacity(workers);
 
     for _ in 0..workers {
@@ -212,8 +221,7 @@ pub struct WireguardRuntime {
 }
 
 struct Inner {
-    /// Network stack - protected by its own lock (high contention)
-    netstack: Mutex<Netstack>,
+    device_config: DeviceConfig,
     /// Peer states - protected by RwLock for read-heavy access
     peers: RwLock<PeerManager>,
     /// UDP socket - Arc for sharing without lock
@@ -226,9 +234,7 @@ struct Inner {
     encrypt_tx: mpsc::UnboundedSender<OutboundPacket>,
     /// Decrypted IP packets produced by crypto workers.
     inbound_tx: mpsc::UnboundedSender<Vec<crate::netstack::PacketBuf>>,
-    /// Receive side of `inbound_tx`.
-    inbound_rx: Mutex<mpsc::UnboundedReceiver<Vec<crate::netstack::PacketBuf>>>,
-    /// Wakes the smoltcp poll loop when new work arrives.
+    /// Wakes the netstack poll loop when new work arrives.
     poll_notify: Notify,
     /// Wakes tasks waiting on socket readiness/state changes.
     io_notify: Notify,
@@ -245,6 +251,51 @@ struct Inner {
     mtu: usize,
     /// Buffer pool for reducing allocations
     buffer_pool: Arc<BufferPool>,
+
+    /// Control plane for netstack operations (connect/read/write/etc).
+    netstack_cmd_tx: mpsc::UnboundedSender<NetstackCmd>,
+}
+
+enum NetstackCmd {
+    TcpConnect {
+        remote: SocketAddr,
+        reply: oneshot::Sender<anyhow::Result<smoltcp::iface::SocketHandle>>,
+    },
+    TcpListen {
+        port: u16,
+        reply: oneshot::Sender<anyhow::Result<smoltcp::iface::SocketHandle>>,
+    },
+    TcpWaitEstablished {
+        handle: smoltcp::iface::SocketHandle,
+        deadline: tokio::time::Instant,
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
+    TcpRead {
+        handle: smoltcp::iface::SocketHandle,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<anyhow::Result<(usize, Vec<u8>)>>,
+    },
+    TcpWrite {
+        handle: smoltcp::iface::SocketHandle,
+        data: Vec<u8>,
+        reply: oneshot::Sender<anyhow::Result<usize>>,
+    },
+    TcpClose {
+        handle: smoltcp::iface::SocketHandle,
+    },
+
+    UdpExchange {
+        target: SocketAddr,
+        payload: Vec<u8>,
+        deadline: tokio::time::Instant,
+        reply: oneshot::Sender<anyhow::Result<Vec<u8>>>,
+    },
+
+    IcmpPing {
+        target: IpAddr,
+        timeout: Duration,
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
 }
 
 struct PeerManager {
@@ -317,20 +368,18 @@ impl WireguardRuntime {
         let (decrypt_tx, decrypt_rx) = mpsc::unbounded_channel();
         let (encrypt_tx, encrypt_rx) = mpsc::unbounded_channel();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let (netstack_cmd_tx, netstack_cmd_rx) = mpsc::unbounded_channel();
 
         let buffer_pool = Arc::new(BufferPool::new(128, 64));
 
-        let netstack = Netstack::new(&config.addresses, mtu, Arc::clone(&buffer_pool));
-
         let inner = Arc::new(Inner {
-            netstack: Mutex::new(netstack),
+            device_config: config.clone(),
             peers: RwLock::new(peer_manager),
             udp: udp.clone(),
             outbound_tx,
             decrypt_tx,
             encrypt_tx,
             inbound_tx,
-            inbound_rx: Mutex::new(inbound_rx),
             poll_notify: Notify::new(),
             io_notify: Notify::new(),
             started: AtomicBool::new(false),
@@ -339,7 +388,16 @@ impl WireguardRuntime {
             listen_port: config.listen_port,
             mtu,
             buffer_pool,
+            netstack_cmd_tx,
         });
+
+        let netstack = Netstack::new(&config.addresses, mtu, Arc::clone(&inner.buffer_pool));
+        tokio::spawn(netstack_loop(
+            Arc::clone(&inner),
+            netstack,
+            netstack_cmd_rx,
+            inbound_rx,
+        ));
 
         // Spawn the event-driven outbound sender task
         let udp_clone = udp.clone();
@@ -407,137 +465,29 @@ impl WireguardRuntime {
     }
 
     pub async fn ping(&self, target: IpAddr, timeout: Duration) -> anyhow::Result<()> {
-        let ident: u16 = rand::random();
-        let seq_no: u16 = rand::random();
-        let mut payload = [0u8; 16];
-        rand::rng().fill_bytes(&mut payload);
-
-        let (handle, target_addr, v6_src) = {
-            let mut netstack = self.inner.netstack.lock();
-            let rx = icmp::PacketBuffer::new(
-                vec![icmp::PacketMetadata::EMPTY; 4],
-                vec![0u8; ICMP_RX_BUFFER],
-            );
-            let tx = icmp::PacketBuffer::new(
-                vec![icmp::PacketMetadata::EMPTY; 4],
-                vec![0u8; ICMP_TX_BUFFER],
-            );
-            let mut socket = icmp::Socket::new(rx, tx);
-            socket
-                .bind(icmp::Endpoint::Ident(ident))
-                .map_err(|e| anyhow::anyhow!("icmp bind error: {e:?}"))?;
-            let handle = netstack.add_socket(socket);
-
-            let target_addr = to_ip_address(target);
-            let v6_src = match target {
-                IpAddr::V4(dst) => {
-                    let dst_addr: Ipv4Address = dst;
-                    let _src_addr = netstack
-                        .iface
-                        .get_source_address_ipv4(&dst_addr)
-                        .ok_or_else(|| anyhow::anyhow!("no IPv4 source address for {dst}"))?;
-                    let repr = Icmpv4Repr::EchoRequest {
-                        ident,
-                        seq_no,
-                        data: &payload,
-                    };
-                    let mut buf = vec![0u8; repr.buffer_len()];
-                    repr.emit(
-                        &mut Icmpv4Packet::new_unchecked(&mut buf),
-                        &ChecksumCapabilities::default(),
-                    );
-                    let socket = netstack.sockets.get_mut::<icmp::Socket>(handle);
-                    socket
-                        .send_slice(&buf, target_addr)
-                        .map_err(|e| anyhow::anyhow!("icmp send error: {e:?}"))?;
-                    None
-                }
-                IpAddr::V6(dst) => {
-                    let dst_addr: Ipv6Address = dst;
-                    let src_addr = netstack.iface.get_source_address_ipv6(&dst_addr);
-                    let repr = Icmpv6Repr::EchoRequest {
-                        ident,
-                        seq_no,
-                        data: &payload,
-                    };
-                    let mut buf = vec![0u8; repr.buffer_len()];
-                    repr.emit(
-                        &src_addr,
-                        &dst_addr,
-                        &mut Icmpv6Packet::new_unchecked(&mut buf),
-                        &ChecksumCapabilities::default(),
-                    );
-                    let socket = netstack.sockets.get_mut::<icmp::Socket>(handle);
-                    socket
-                        .send_slice(&buf, target_addr)
-                        .map_err(|e| anyhow::anyhow!("icmp send error: {e:?}"))?;
-                    Some(src_addr)
-                }
-            };
-
-            (handle, target_addr, v6_src)
-        };
-
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.inner.netstack_cmd_tx.send(NetstackCmd::IcmpPing {
+            target,
+            timeout,
+            reply: reply_tx,
+        });
         self.inner.poll_notify.notify_one();
-
-        let deadline = Instant::now() + timeout;
-        let mut recv_buf = [0u8; 512];
-        loop {
-            {
-                let mut netstack = self.inner.netstack.lock();
-                let socket = netstack.sockets.get_mut::<icmp::Socket>(handle);
-                if socket.can_recv() {
-                    let (len, from) = socket
-                        .recv_slice(&mut recv_buf)
-                        .map_err(|e| anyhow::anyhow!("icmp recv error: {e:?}"))?;
-                    if from == target_addr
-                        && matches_echo_reply(&recv_buf[..len], target_addr, v6_src, ident, seq_no)
-                    {
-                        netstack.sockets.remove(handle);
-                        self.inner.poll_notify.notify_one();
-                        return Ok(());
-                    }
-                }
-            }
-
-            if Instant::now() >= deadline {
-                let mut netstack = self.inner.netstack.lock();
-                netstack.sockets.remove(handle);
-                self.inner.poll_notify.notify_one();
-                anyhow::bail!("icmp ping timed out");
-            }
-
-            self.inner.io_notify.notified().await;
-        }
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("netstack task dropped ping"))??;
+        Ok(())
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> anyhow::Result<WgTcpConnection> {
-        let handle = {
-            let peers = self.inner.peers.read();
-            if peers.allowed_ips.find(addr.ip()).is_none() {
-                anyhow::bail!("no peer for destination {addr}");
-            }
-            drop(peers);
-
-            let mut netstack = self.inner.netstack.lock();
-            let rx = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER]);
-            let tx = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER]);
-            let mut socket = tcp::Socket::new(rx, tx);
-            socket.set_nagle_enabled(false);
-
-            let handle = netstack.add_socket(socket);
-            let local_port = random_ephemeral_port();
-            netstack
-                .tcp_connect(
-                    handle,
-                    IpEndpoint::new(to_ip_address(addr.ip()), addr.port()),
-                    IpListenEndpoint::from(local_port),
-                )
-                .map_err(|e| anyhow::anyhow!("tcp connect error: {e:?}"))?;
-            handle
-        };
-
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.inner.netstack_cmd_tx.send(NetstackCmd::TcpConnect {
+            remote: addr,
+            reply: reply_tx,
+        });
         self.inner.poll_notify.notify_one();
+        let handle = reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("netstack task dropped tcp connect"))??;
 
         let mut conn = WgTcpConnection {
             handle: Arc::new(std::sync::Mutex::new(Some(handle))),
@@ -555,39 +505,37 @@ impl WireguardRuntime {
     }
 
     pub async fn accept(&self, port: u16) -> anyhow::Result<WgTcpConnection> {
-        let handle = {
-            let mut netstack = self.inner.netstack.lock();
-            let rx = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER]);
-            let tx = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER]);
-            let mut socket = tcp::Socket::new(rx, tx);
-            socket
-                .listen(IpListenEndpoint::from(port))
-                .map_err(|e| anyhow::anyhow!("tcp listen error: {e:?}"))?;
-            netstack.add_socket(socket)
-        };
-
+        let (listen_tx, listen_rx) = oneshot::channel();
+        let _ = self.inner.netstack_cmd_tx.send(NetstackCmd::TcpListen {
+            port,
+            reply: listen_tx,
+        });
         self.inner.poll_notify.notify_one();
+        let handle = listen_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("netstack task dropped tcp listen"))??;
 
-        loop {
-            {
-                let mut netstack = self.inner.netstack.lock();
-                let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
-                match socket.state() {
-                    tcp::State::Established => {
-                        return Ok(WgTcpConnection {
-                            handle: Arc::new(std::sync::Mutex::new(Some(handle))),
-                            runtime: self.clone(),
-                        });
-                    }
-                    tcp::State::Closed => {
-                        netstack.sockets.remove(handle);
-                        anyhow::bail!("listener closed before accept");
-                    }
-                    _ => {}
-                }
-            }
-            self.inner.io_notify.notified().await;
-        }
+        // For now, accept is treated as "wait for established" on the listening socket.
+        // This mirrors the previous (simplified) behavior.
+        let (wait_tx, wait_rx) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + TCP_CONNECT_TIMEOUT;
+        let _ = self
+            .inner
+            .netstack_cmd_tx
+            .send(NetstackCmd::TcpWaitEstablished {
+                handle,
+                deadline,
+                reply: wait_tx,
+            });
+        self.inner.poll_notify.notify_one();
+        wait_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("netstack task dropped tcp accept"))??;
+
+        Ok(WgTcpConnection {
+            handle: Arc::new(std::sync::Mutex::new(Some(handle))),
+            runtime: self.clone(),
+        })
     }
 
     pub async fn udp_exchange(
@@ -595,55 +543,18 @@ impl WireguardRuntime {
         target: SocketAddr,
         payload: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
-        let handle = {
-            let mut netstack = self.inner.netstack.lock();
-            let rx = udp::PacketBuffer::new(
-                vec![udp::PacketMetadata::EMPTY; 4],
-                vec![0u8; UDP_RX_BUFFER],
-            );
-            let tx = udp::PacketBuffer::new(
-                vec![udp::PacketMetadata::EMPTY; 4],
-                vec![0u8; UDP_TX_BUFFER],
-            );
-            let mut socket = udp::Socket::new(rx, tx);
-            let local_port = random_ephemeral_port();
-            socket
-                .bind(IpListenEndpoint::from(local_port))
-                .map_err(|e| anyhow::anyhow!("udp bind error: {e:?}"))?;
-            let handle = netstack.add_socket(socket);
-            let socket = netstack.sockets.get_mut::<udp::Socket>(handle);
-            socket
-                .send_slice(
-                    payload,
-                    IpEndpoint::new(to_ip_address(target.ip()), target.port()),
-                )
-                .map_err(|e| anyhow::anyhow!("udp send error: {e:?}"))?;
-            handle
-        };
-
-        self.inner.poll_notify.notify_one();
-
+        let (reply_tx, reply_rx) = oneshot::channel();
         let deadline = tokio::time::Instant::now() + DNS_TIMEOUT;
-        loop {
-            {
-                let mut netstack = self.inner.netstack.lock();
-                let socket = netstack.sockets.get_mut::<udp::Socket>(handle);
-                if socket.can_recv() {
-                    let (data, _) = socket
-                        .recv()
-                        .map_err(|e| anyhow::anyhow!("udp recv error: {e:?}"))?;
-                    let result = data.to_vec();
-                    netstack.sockets.remove(handle);
-                    return Ok(result);
-                }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                let mut netstack = self.inner.netstack.lock();
-                netstack.sockets.remove(handle);
-                anyhow::bail!("udp exchange timed out");
-            }
-            self.inner.io_notify.notified().await;
-        }
+        let _ = self.inner.netstack_cmd_tx.send(NetstackCmd::UdpExchange {
+            target,
+            payload: payload.to_vec(),
+            deadline,
+            reply: reply_tx,
+        });
+        self.inner.poll_notify.notify_one();
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("netstack task dropped udp exchange"))?
     }
 
     async fn start_tasks(&self) {
@@ -652,68 +563,13 @@ impl WireguardRuntime {
         }
 
         let runtime = self.clone();
-        tokio::spawn(async move { runtime.poll_loop().await });
-
-        let runtime = self.clone();
         tokio::spawn(async move { runtime.udp_loop().await });
 
         let runtime = self.clone();
         tokio::spawn(async move { runtime.timer_loop().await });
     }
 
-    /// Event-driven poll loop - wakes on notify or timeout
-    async fn poll_loop(&self) {
-        loop {
-            // Drain decrypted packets from crypto workers, then run one poll step.
-            let (frames, did_work, delay) = {
-                let mut netstack = self.inner.netstack.lock();
-
-                // Move decrypted IP packets into smoltcp's RX queue.
-                // This keeps crypto workers off the netstack lock and reduces contention.
-                if let Some(mut rx) = self.inner.inbound_rx.try_lock() {
-                    while let Ok(batch) = rx.try_recv() {
-                        for packet in batch {
-                            netstack.push_inbound(packet);
-                        }
-                    }
-                }
-
-                let did_work = netstack.poll();
-                let frames = netstack.drain_outbound();
-                let delay = netstack.poll_delay();
-                (frames, did_work, delay)
-            };
-
-            if did_work {
-                // The poll loop advanced socket state; wake tasks waiting on readiness.
-                self.inner.io_notify.notify_waiters();
-            }
-
-            if !frames.is_empty() {
-                self.send_frames(frames);
-            }
-
-            // Event-driven: use smoltcp's poll_delay to avoid busy looping.
-            // `poll_delay == 0` means "poll again ASAP" (e.g. more queued work),
-            // so yield instead of sleeping for a fixed interval.
-            match delay {
-                Some(d) if d.is_zero() => {
-                    tokio::task::yield_now().await;
-                }
-                Some(d) => {
-                    tokio::select! {
-                        biased;
-                        _ = self.inner.poll_notify.notified() => {}
-                        _ = tokio::time::sleep(d) => {}
-                    }
-                }
-                None => {
-                    // No timers scheduled by smoltcp; sleep until we have new work.
-                    self.inner.poll_notify.notified().await;
-                }
-            }
-        }
-    }
+    // Netstack is handled by `netstack_loop` (single owner task).
 
     async fn udp_loop(&self) {
         // Receive WireGuard UDP packets. On Linux, use recvmmsg to amortize syscall costs.
@@ -867,32 +723,6 @@ impl WireguardRuntime {
         }
     }
 
-    fn send_frames(&self, frames: Vec<crate::netstack::PacketBuf>) {
-        // Fast path: pick the peer index (allowed IPs) under a read lock,
-        // then queue the actual encryption work to the worker pool.
-        let peers = self.inner.peers.read();
-
-        for frame in frames {
-            let frame_bytes = frame.as_slice();
-            let dst = match dst_ip(frame_bytes) {
-                Some(dst) => dst,
-                None => {
-                    log::warn!("dropping packet without destination");
-                    continue;
-                }
-            };
-            let Some(peer_idx) = peers.allowed_ips.find(dst).cloned() else {
-                log::warn!("no peer for destination {dst}");
-                continue;
-            };
-
-            let _ = self.inner.encrypt_tx.send(OutboundPacket {
-                peer_idx,
-                packet: frame,
-            });
-        }
-    }
-
     /// Handle incoming UDP packet from WireGuard peer
     fn handle_incoming(&self, src: SocketAddr, data: &[u8]) -> anyhow::Result<()> {
         // Determine whether we can route this to a specific peer based on the endpoint.
@@ -924,24 +754,36 @@ impl WgTcpConnection {
             Some(h) => h,
             None => return Ok(0),
         };
+
+        // We pass an owned Vec through the netstack task so we don't keep borrowing across await.
+        // Since the cmd takes ownership, we re-create the Vec on the slow "would block" path.
         loop {
-            {
-                let mut netstack = self.runtime.inner.netstack.lock();
-                let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
-                if socket.can_recv() {
-                    let size = socket
-                        .recv_slice(buf)
-                        .map_err(|e| anyhow::anyhow!("tcp recv error: {e:?}"))?;
-                    if size == 0 {
-                        socket.close();
-                    }
-                    return Ok(size);
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let _ = self
+                .runtime
+                .inner
+                .netstack_cmd_tx
+                .send(NetstackCmd::TcpRead {
+                    handle,
+                    buf: vec![0u8; buf.len()],
+                    reply: reply_tx,
+                });
+            self.runtime.inner.poll_notify.notify_one();
+
+            let result = reply_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("netstack task dropped tcp read"))?;
+
+            match result {
+                Ok((n, returned)) => {
+                    buf[..n].copy_from_slice(&returned[..n]);
+                    return Ok(n);
                 }
-                if socket.state() == tcp::State::Closed {
-                    return Ok(0);
+                Err(err) if err.to_string().contains("would block") => {
+                    self.runtime.inner.io_notify.notified().await;
                 }
+                Err(err) => return Err(err),
             }
-            self.runtime.inner.io_notify.notified().await;
         }
     }
 
@@ -950,22 +792,35 @@ impl WgTcpConnection {
             Some(h) => h,
             None => anyhow::bail!("connection already closed"),
         };
+
         let mut offset = 0;
         while offset < buf.len() {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let _ = self
+                .runtime
+                .inner
+                .netstack_cmd_tx
+                .send(NetstackCmd::TcpWrite {
+                    handle,
+                    data: buf[offset..].to_vec(),
+                    reply: reply_tx,
+                });
+            self.runtime.inner.poll_notify.notify_one();
+
+            match reply_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("netstack task dropped tcp write"))?
             {
-                let mut netstack = self.runtime.inner.netstack.lock();
-                let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
-                if socket.can_send() {
-                    let written = socket
-                        .send_slice(&buf[offset..])
-                        .map_err(|e| anyhow::anyhow!("tcp send error: {e:?}"))?;
-                    offset += written;
-                    self.runtime.inner.poll_notify.notify_one();
-                    continue;
+                Ok(n) => {
+                    offset += n;
                 }
+                Err(err) if err.to_string().contains("would block") => {
+                    self.runtime.inner.io_notify.notified().await;
+                }
+                Err(err) => return Err(err),
             }
-            self.runtime.inner.io_notify.notified().await;
         }
+
         Ok(offset)
     }
 
@@ -974,12 +829,11 @@ impl WgTcpConnection {
             Some(h) => h,
             None => return,
         };
-        let mut netstack = self.runtime.inner.netstack.lock();
-        {
-            let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
-            socket.close();
-        }
-        netstack.sockets.remove(handle);
+        let _ = self
+            .runtime
+            .inner
+            .netstack_cmd_tx
+            .send(NetstackCmd::TcpClose { handle });
         self.runtime.inner.poll_notify.notify_one();
     }
 
@@ -988,33 +842,24 @@ impl WgTcpConnection {
             Some(h) => h,
             None => anyhow::bail!("connection already closed"),
         };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
         let deadline = tokio::time::Instant::now() + TCP_CONNECT_TIMEOUT;
-        loop {
-            {
-                let mut netstack = self.runtime.inner.netstack.lock();
-                let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
-                match socket.state() {
-                    tcp::State::Established => return Ok(()),
-                    tcp::State::Closed => {
-                        *self.handle.lock().unwrap() = None;
-                        netstack.sockets.remove(handle);
-                        anyhow::bail!("tcp connection failed to establish");
-                    }
-                    _ => {}
-                }
-            }
+        let _ = self
+            .runtime
+            .inner
+            .netstack_cmd_tx
+            .send(NetstackCmd::TcpWaitEstablished {
+                handle,
+                deadline,
+                reply: reply_tx,
+            });
+        self.runtime.inner.poll_notify.notify_one();
 
-            if tokio::time::Instant::now() >= deadline {
-                let mut netstack = self.runtime.inner.netstack.lock();
-                let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
-                socket.abort();
-                netstack.sockets.remove(handle);
-                *self.handle.lock().unwrap() = None;
-                anyhow::bail!("tcp connection timed out");
-            }
-
-            self.runtime.inner.io_notify.notified().await;
-        }
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("netstack task dropped tcp wait"))??;
+        Ok(())
     }
 }
 
@@ -1269,4 +1114,426 @@ fn process_datagram(
 
 fn random_ephemeral_port() -> u16 {
     rand::random_range(49152..65535)
+}
+
+async fn netstack_loop(
+    inner: Arc<Inner>,
+    mut netstack: Netstack,
+    mut cmd_rx: mpsc::UnboundedReceiver<NetstackCmd>,
+    mut inbound_rx: mpsc::UnboundedReceiver<Vec<crate::netstack::PacketBuf>>,
+) {
+    type PendingConnect = (tokio::time::Instant, oneshot::Sender<anyhow::Result<()>>);
+    type PendingUdp = (
+        tokio::time::Instant,
+        oneshot::Sender<anyhow::Result<Vec<u8>>>,
+    );
+    type PendingIcmp = (
+        tokio::time::Instant,
+        oneshot::Sender<anyhow::Result<()>>,
+        IpAddress,
+        Option<Ipv6Address>,
+        u16,
+        u16,
+    );
+
+    // Track per-operation state so callers don't need to hold any locks.
+    let mut pending_connects: HashMap<smoltcp::iface::SocketHandle, PendingConnect> =
+        HashMap::new();
+    let mut pending_udp: HashMap<smoltcp::iface::SocketHandle, PendingUdp> = HashMap::new();
+    let mut pending_icmp: HashMap<smoltcp::iface::SocketHandle, PendingIcmp> = HashMap::new();
+
+    loop {
+        // Fast-path: apply decrypted inbound packets.
+        while let Ok(batch) = inbound_rx.try_recv() {
+            for packet in batch {
+                netstack.push_inbound(packet);
+            }
+        }
+
+        // Drain commands without blocking. We keep this bounded implicitly by how many are queued.
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                NetstackCmd::TcpConnect { remote, reply } => {
+                    let result = (|| {
+                        let peers = inner.peers.read();
+                        if peers.allowed_ips.find(remote.ip()).is_none() {
+                            anyhow::bail!("no peer for destination {remote}");
+                        }
+                        drop(peers);
+
+                        let rx = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER]);
+                        let tx = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER]);
+                        let mut socket = tcp::Socket::new(rx, tx);
+                        socket.set_nagle_enabled(false);
+
+                        let handle = netstack.add_socket(socket);
+                        let local_port = random_ephemeral_port();
+                        netstack
+                            .tcp_connect(
+                                handle,
+                                IpEndpoint::new(to_ip_address(remote.ip()), remote.port()),
+                                IpListenEndpoint::from(local_port),
+                            )
+                            .map_err(|e| anyhow::anyhow!("tcp connect error: {e:?}"))?;
+                        Ok(handle)
+                    })();
+                    let _ = reply.send(result);
+                    inner.poll_notify.notify_one();
+                }
+                NetstackCmd::TcpListen { port, reply } => {
+                    let result = (|| {
+                        let rx = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER]);
+                        let tx = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER]);
+                        let mut socket = tcp::Socket::new(rx, tx);
+                        socket
+                            .listen(IpListenEndpoint::from(port))
+                            .map_err(|e| anyhow::anyhow!("tcp listen error: {e:?}"))?;
+                        Ok(netstack.add_socket(socket))
+                    })();
+                    let _ = reply.send(result);
+                    inner.poll_notify.notify_one();
+                }
+                NetstackCmd::TcpWaitEstablished {
+                    handle,
+                    deadline,
+                    reply,
+                } => {
+                    pending_connects.insert(handle, (deadline, reply));
+                    inner.poll_notify.notify_one();
+                }
+                NetstackCmd::TcpRead {
+                    handle,
+                    mut buf,
+                    reply,
+                } => {
+                    let result = (|| {
+                        let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
+                        if socket.can_recv() {
+                            let size = socket
+                                .recv_slice(&mut buf)
+                                .map_err(|e| anyhow::anyhow!("tcp recv error: {e:?}"))?;
+                            if size == 0 {
+                                socket.close();
+                            }
+                            return Ok((size, buf));
+                        }
+                        if socket.state() == tcp::State::Closed {
+                            return Ok((0, buf));
+                        }
+                        anyhow::bail!("would block")
+                    })();
+                    let _ = reply.send(result);
+                }
+                NetstackCmd::TcpWrite {
+                    handle,
+                    data,
+                    reply,
+                } => {
+                    let result = (|| {
+                        let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
+                        if socket.can_send() {
+                            let written = socket
+                                .send_slice(&data)
+                                .map_err(|e| anyhow::anyhow!("tcp send error: {e:?}"))?;
+                            inner.poll_notify.notify_one();
+                            return Ok(written);
+                        }
+                        anyhow::bail!("would block")
+                    })();
+                    let _ = reply.send(result);
+                }
+                NetstackCmd::TcpClose { handle } => {
+                    {
+                        let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
+                        socket.close();
+                    }
+                    netstack.sockets.remove(handle);
+                    inner.poll_notify.notify_one();
+                }
+
+                NetstackCmd::UdpExchange {
+                    target,
+                    payload,
+                    deadline,
+                    reply,
+                } => {
+                    let result = (|| {
+                        let rx = udp::PacketBuffer::new(
+                            vec![udp::PacketMetadata::EMPTY; 4],
+                            vec![0u8; UDP_RX_BUFFER],
+                        );
+                        let tx = udp::PacketBuffer::new(
+                            vec![udp::PacketMetadata::EMPTY; 4],
+                            vec![0u8; UDP_TX_BUFFER],
+                        );
+                        let mut socket = udp::Socket::new(rx, tx);
+                        let local_port = random_ephemeral_port();
+                        socket
+                            .bind(IpListenEndpoint::from(local_port))
+                            .map_err(|e| anyhow::anyhow!("udp bind error: {e:?}"))?;
+                        let handle = netstack.add_socket(socket);
+                        let socket = netstack.sockets.get_mut::<udp::Socket>(handle);
+                        socket
+                            .send_slice(
+                                &payload,
+                                IpEndpoint::new(to_ip_address(target.ip()), target.port()),
+                            )
+                            .map_err(|e| anyhow::anyhow!("udp send error: {e:?}"))?;
+                        Ok(handle)
+                    })();
+
+                    match result {
+                        Ok(handle) => {
+                            pending_udp.insert(handle, (deadline, reply));
+                            inner.poll_notify.notify_one();
+                        }
+                        Err(err) => {
+                            let _ = reply.send(Err(err));
+                        }
+                    }
+                }
+
+                NetstackCmd::IcmpPing {
+                    target,
+                    timeout,
+                    reply,
+                } => {
+                    let result = (|| {
+                        let ident: u16 = rand::random();
+                        let seq_no: u16 = rand::random();
+                        let mut payload = [0u8; 16];
+                        rand::rng().fill_bytes(&mut payload);
+
+                        let rx = icmp::PacketBuffer::new(
+                            vec![icmp::PacketMetadata::EMPTY; 4],
+                            vec![0u8; ICMP_RX_BUFFER],
+                        );
+                        let tx = icmp::PacketBuffer::new(
+                            vec![icmp::PacketMetadata::EMPTY; 4],
+                            vec![0u8; ICMP_TX_BUFFER],
+                        );
+                        let mut socket = icmp::Socket::new(rx, tx);
+                        socket
+                            .bind(icmp::Endpoint::Ident(ident))
+                            .map_err(|e| anyhow::anyhow!("icmp bind error: {e:?}"))?;
+                        let handle = netstack.add_socket(socket);
+
+                        let target_addr = to_ip_address(target);
+                        let v6_src = match target {
+                            IpAddr::V4(dst) => {
+                                let dst_addr: Ipv4Address = dst;
+                                let _src_addr = netstack
+                                    .iface
+                                    .get_source_address_ipv4(&dst_addr)
+                                    .ok_or_else(|| {
+                                    anyhow::anyhow!("no IPv4 source address for {dst}")
+                                })?;
+                                let repr = Icmpv4Repr::EchoRequest {
+                                    ident,
+                                    seq_no,
+                                    data: &payload,
+                                };
+                                let mut buf = vec![0u8; repr.buffer_len()];
+                                repr.emit(
+                                    &mut Icmpv4Packet::new_unchecked(&mut buf),
+                                    &ChecksumCapabilities::default(),
+                                );
+                                let socket = netstack.sockets.get_mut::<icmp::Socket>(handle);
+                                socket
+                                    .send_slice(&buf, target_addr)
+                                    .map_err(|e| anyhow::anyhow!("icmp send error: {e:?}"))?;
+                                None
+                            }
+                            IpAddr::V6(dst) => {
+                                let dst_addr: Ipv6Address = dst;
+                                let src_addr = netstack.iface.get_source_address_ipv6(&dst_addr);
+                                let repr = Icmpv6Repr::EchoRequest {
+                                    ident,
+                                    seq_no,
+                                    data: &payload,
+                                };
+                                let mut buf = vec![0u8; repr.buffer_len()];
+                                repr.emit(
+                                    &src_addr,
+                                    &dst_addr,
+                                    &mut Icmpv6Packet::new_unchecked(&mut buf),
+                                    &ChecksumCapabilities::default(),
+                                );
+                                let socket = netstack.sockets.get_mut::<icmp::Socket>(handle);
+                                socket
+                                    .send_slice(&buf, target_addr)
+                                    .map_err(|e| anyhow::anyhow!("icmp send error: {e:?}"))?;
+                                Some(src_addr)
+                            }
+                        };
+
+                        Ok((
+                            handle,
+                            tokio::time::Instant::now() + timeout,
+                            target_addr,
+                            v6_src,
+                            ident,
+                            seq_no,
+                        ))
+                    })();
+
+                    match result {
+                        Ok((handle, deadline, target_addr, v6_src, ident, seq_no)) => {
+                            pending_icmp.insert(
+                                handle,
+                                (deadline, reply, target_addr, v6_src, ident, seq_no),
+                            );
+                            inner.poll_notify.notify_one();
+                        }
+                        Err(err) => {
+                            let _ = reply.send(Err(err));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Run one poll step and dispatch outbound frames.
+        let did_work = netstack.poll();
+        let frames = netstack.drain_outbound();
+        if did_work {
+            inner.io_notify.notify_waiters();
+        }
+        if !frames.is_empty() {
+            // Send frames for encryption.
+            let peers = inner.peers.read();
+            for frame in frames {
+                let frame_bytes = frame.as_slice();
+                let dst = match dst_ip(frame_bytes) {
+                    Some(dst) => dst,
+                    None => continue,
+                };
+                let Some(peer_idx) = peers.allowed_ips.find(dst).cloned() else {
+                    continue;
+                };
+                let _ = inner.encrypt_tx.send(OutboundPacket {
+                    peer_idx,
+                    packet: frame,
+                });
+            }
+        }
+
+        // Progress pending connect/readiness-style operations.
+        if !pending_connects.is_empty() {
+            let now = tokio::time::Instant::now();
+            let mut done = Vec::new();
+            for (&handle, (deadline, _)) in &pending_connects {
+                if now >= *deadline {
+                    done.push(handle);
+                    continue;
+                }
+                let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
+                let state = socket.state();
+                if matches!(state, tcp::State::Established | tcp::State::Closed) {
+                    done.push(handle);
+                }
+            }
+            for handle in done {
+                if let Some((deadline, reply)) = pending_connects.remove(&handle) {
+                    let now = tokio::time::Instant::now();
+                    let socket = netstack.sockets.get_mut::<tcp::Socket>(handle);
+                    let state = socket.state();
+                    let res = if now >= deadline {
+                        netstack.sockets.remove(handle);
+                        Err(anyhow::anyhow!("tcp connect timed out"))
+                    } else if state == tcp::State::Established {
+                        Ok(())
+                    } else if state == tcp::State::Closed {
+                        netstack.sockets.remove(handle);
+                        Err(anyhow::anyhow!("connection closed"))
+                    } else {
+                        Ok(())
+                    };
+                    let _ = reply.send(res);
+                }
+            }
+        }
+
+        if !pending_udp.is_empty() {
+            let now = tokio::time::Instant::now();
+            let mut done = Vec::new();
+            for (&handle, (deadline, _)) in &pending_udp {
+                if now >= *deadline {
+                    done.push(handle);
+                    continue;
+                }
+                let socket = netstack.sockets.get_mut::<udp::Socket>(handle);
+                if socket.can_recv() {
+                    done.push(handle);
+                }
+            }
+            for handle in done {
+                if let Some((deadline, reply)) = pending_udp.remove(&handle) {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        netstack.sockets.remove(handle);
+                        let _ = reply.send(Err(anyhow::anyhow!("udp exchange timed out")));
+                        continue;
+                    }
+                    let socket = netstack.sockets.get_mut::<udp::Socket>(handle);
+                    if socket.can_recv() {
+                        match socket.recv() {
+                            Ok((data, _)) => {
+                                let out = data.to_vec();
+                                netstack.sockets.remove(handle);
+                                let _ = reply.send(Ok(out));
+                            }
+                            Err(e) => {
+                                netstack.sockets.remove(handle);
+                                let _ = reply.send(Err(anyhow::anyhow!("udp recv error: {e:?}")));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !pending_icmp.is_empty() {
+            let now = tokio::time::Instant::now();
+            let mut done = Vec::new();
+            let mut recv_buf = [0u8; 512];
+            for (&handle, (deadline, _, target_addr, v6_src, ident, seq_no)) in &pending_icmp {
+                if now >= *deadline {
+                    done.push(handle);
+                    continue;
+                }
+                let socket = netstack.sockets.get_mut::<icmp::Socket>(handle);
+                if socket.can_recv()
+                    && let Ok((len, from)) = socket.recv_slice(&mut recv_buf)
+                    && from == *target_addr
+                    && matches_echo_reply(&recv_buf[..len], *target_addr, *v6_src, *ident, *seq_no)
+                {
+                    done.push(handle);
+                }
+            }
+            for handle in done {
+                if let Some((_deadline, reply, _target_addr, _v6_src, _ident, _seq_no)) =
+                    pending_icmp.remove(&handle)
+                {
+                    netstack.sockets.remove(handle);
+                    let _ = reply.send(Ok(()));
+                }
+            }
+        }
+
+        // Sleep/yield until new work. We rely on poll_notify for readiness.
+        match netstack.poll_delay() {
+            Some(d) if d.is_zero() => tokio::task::yield_now().await,
+            Some(d) => {
+                tokio::select! {
+                    biased;
+                    _ = inner.poll_notify.notified() => {},
+                    _ = tokio::time::sleep(d) => {},
+                }
+            }
+            None => {
+                inner.poll_notify.notified().await;
+            }
+        }
+    }
 }
