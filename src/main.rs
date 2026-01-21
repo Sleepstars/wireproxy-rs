@@ -1,14 +1,16 @@
 mod app;
-mod buffer;
 mod config;
+
 mod dns;
 mod health;
 mod http_proxy;
-mod netstack;
 mod proxy;
 mod socks5;
 mod target;
 mod tunnel;
+
+mod buffer;
+mod netstack;
 mod wg;
 
 use std::path::PathBuf;

@@ -24,13 +24,6 @@ pub struct DeviceConfig {
     pub peers: Vec<PeerConfig>,
     pub check_alive: Vec<IpAddr>,
     pub check_alive_interval: u64,
-
-    /// Maximum number of worker threads for the userspace netstack.
-    ///
-    /// The netstack itself is single-threaded, but it can become a bottleneck if
-    /// other tasks contend on a shared lock. The runtime uses this value to size
-    /// its internal worker pools and to make performance behavior configurable.
-    pub worker_threads: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -276,18 +269,6 @@ fn parse_interface(ini: &IniFile) -> Result<DeviceConfig, ConfigError> {
         None => 5,
     };
 
-    let worker_threads = match section.get("WorkerThreads")? {
-        Some(value) => Some(
-            value
-                .parse::<usize>()
-                .map_err(|e| ConfigError::InvalidValue {
-                    key: "WorkerThreads".to_string(),
-                    reason: e.to_string(),
-                })?,
-        ),
-        None => None,
-    };
-
     Ok(DeviceConfig {
         private_key,
         addresses,
@@ -297,7 +278,6 @@ fn parse_interface(ini: &IniFile) -> Result<DeviceConfig, ConfigError> {
         peers: Vec::new(),
         check_alive,
         check_alive_interval,
-        worker_threads,
     })
 }
 

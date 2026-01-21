@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -8,10 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
-use boringtun::device::allowed_ips::AllowedIps;
-use boringtun::noise::{Tunn, TunnResult};
-use boringtun::x25519::{PublicKey, StaticSecret};
-use parking_lot::{Mutex, RwLock};
+use bytes::BytesMut;
+use ipnetwork::IpNetwork;
 use rand::RngCore;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::{icmp, tcp, udp};
@@ -19,174 +18,19 @@ use smoltcp::wire::{
     Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress, IpEndpoint, IpListenEndpoint,
     Ipv4Address, Ipv6Address,
 };
-use socket2::{Domain, Protocol, Socket, Type};
-use tokio::net::UdpSocket;
-
-#[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
 use tokio::sync::{Notify, mpsc, oneshot};
 
-fn default_worker_count() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .max(1)
-}
-
-fn runtime_worker_count(config: &DeviceConfig) -> usize {
-    config
-        .worker_threads
-        .unwrap_or_else(default_worker_count)
-        .max(1)
-}
-
-fn spawn_decryption_workers(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<EncryptedDatagram>) {
-    // boringtun's tunnel state is effectively single-threaded per peer; extra workers just add
-    // contention when we only have a small number of peers.
-    let peer_count = inner.peers.read().peers.len().max(1);
-    let workers = runtime_worker_count(&inner.device_config).min(peer_count);
-    let mut worker_txs: Vec<mpsc::UnboundedSender<EncryptedDatagram>> = Vec::with_capacity(workers);
-
-    for _ in 0..workers {
-        let (tx, mut worker_rx) = mpsc::unbounded_channel();
-        worker_txs.push(tx);
-
-        let inner = Arc::clone(&inner);
-        tokio::spawn(async move {
-            while let Some(dg) = worker_rx.recv().await {
-                // If we know which peer this belongs to (endpoint match), avoid scanning.
-                if let Some(peer_idx) = dg.peer_idx {
-                    let mut inbound_packets = Vec::new();
-                    {
-                        let peer = {
-                            let peers = inner.peers.read();
-                            Arc::clone(&peers.peers[peer_idx].tunn)
-                        };
-                        process_datagram(
-                            &peer,
-                            dg.src,
-                            &dg.buf[..dg.len],
-                            &inner.outbound_tx,
-                            &mut inbound_packets,
-                            &inner.buffer_pool,
-                        );
-                    }
-
-                    if !inbound_packets.is_empty() {
-                        // Hand packets off to the poll loop to avoid blocking crypto workers
-                        // on the netstack lock.
-                        let _ = inner.inbound_tx.send(inbound_packets);
-                    }
-
-                    inner.poll_notify.notify_one();
-                    continue;
-                }
-
-                // Otherwise, try each peer (slow path; should be rare if endpoints are stable).
-                // Snapshot the tunnels so we don't hold the peers lock while attempting decapsulation.
-                let peers: Vec<Arc<Mutex<Tunn>>> = {
-                    let peers = inner.peers.read();
-                    peers.peers.iter().map(|p| Arc::clone(&p.tunn)).collect()
-                };
-
-                let mut inbound_packets = Vec::new();
-                for peer in peers {
-                    let handled = process_datagram(
-                        &peer,
-                        dg.src,
-                        &dg.buf[..dg.len],
-                        &inner.outbound_tx,
-                        &mut inbound_packets,
-                        &inner.buffer_pool,
-                    );
-                    if handled {
-                        break;
-                    }
-                }
-
-                if !inbound_packets.is_empty() {
-                    // Hand packets off to the poll loop to avoid blocking crypto workers
-                    // on the netstack lock.
-                    let _ = inner.inbound_tx.send(inbound_packets);
-                }
-
-                inner.poll_notify.notify_one();
-            }
-        });
-    }
-
-    tokio::spawn(async move {
-        let mut next = 0usize;
-        while let Some(dg) = rx.recv().await {
-            if worker_txs.is_empty() {
-                break;
-            }
-            let idx = next % worker_txs.len();
-            next = next.wrapping_add(1);
-            let _ = worker_txs[idx].send(dg);
-        }
-    });
-}
-
-fn spawn_encryption_workers(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<OutboundPacket>) {
-    let workers = runtime_worker_count(&inner.device_config);
-    let mut worker_txs: Vec<mpsc::UnboundedSender<OutboundPacket>> = Vec::with_capacity(workers);
-
-    for _ in 0..workers {
-        let (tx, mut worker_rx) = mpsc::unbounded_channel();
-        worker_txs.push(tx);
-
-        let inner = Arc::clone(&inner);
-        tokio::spawn(async move {
-            while let Some(job) = worker_rx.recv().await {
-                let mut out = inner.buffer_pool.get_small();
-
-                let (endpoint, tunn) = {
-                    let peers = inner.peers.read();
-                    let peer = &peers.peers[job.peer_idx];
-                    (peer.endpoint, Arc::clone(&peer.tunn))
-                };
-
-                match tunn.lock().encapsulate(job.packet.as_slice(), &mut out[..]) {
-                    TunnResult::WriteToNetwork(packet) => {
-                        let len = packet.len();
-                        let _ = inner.outbound_tx.send(Datagram {
-                            endpoint,
-                            buf: out,
-                            len,
-                        });
-                    }
-                    // If there is no session, boringtun may ask us to send a handshake initiation.
-                    // Those are also `WriteToNetwork` and handled above.
-                    TunnResult::Err(err) => {
-                        log::warn!("wireguard encapsulate error: {err:?}");
-                    }
-                    _ => {}
-                }
-            }
-        });
-    }
-
-    tokio::spawn(async move {
-        let mut next = 0usize;
-        while let Some(job) = rx.recv().await {
-            if worker_txs.is_empty() {
-                break;
-            }
-            let idx = next % worker_txs.len();
-            next = next.wrapping_add(1);
-            let _ = worker_txs[idx].send(job);
-        }
-    });
-}
-
 use crate::buffer::BufferPool;
-use crate::config::{DeviceConfig, PeerConfig};
-use crate::netstack::Netstack;
+use crate::config::DeviceConfig;
+use crate::netstack::{Netstack, PacketBuf};
 
-const TIMER_INTERVAL: Duration = Duration::from_millis(100);
+use gotatun::device::{Device, DeviceBuilder, Peer as WgPeer};
+use gotatun::packet::{Ip as WgIp, Packet as WgPacket, PacketBufPool};
+use gotatun::tun::{IpRecv, IpSend, MtuWatcher};
+
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 const TCP_RX_BUFFER: usize = 512 * 1024;
 const TCP_TX_BUFFER: usize = 512 * 1024;
 const UDP_RX_BUFFER: usize = 2048;
@@ -194,26 +38,49 @@ const UDP_TX_BUFFER: usize = 2048;
 const ICMP_RX_BUFFER: usize = 256;
 const ICMP_TX_BUFFER: usize = 256;
 
-/// Outbound datagram for UDP sending.
-struct Datagram {
-    endpoint: SocketAddr,
-    buf: crate::buffer::PooledSmallBuffer,
-    len: usize,
+/// A minimal in-process "IP link" that connects gotatun <-> our smoltcp netstack.
+///
+/// - `IpSend` is used by gotatun to deliver decrypted IP packets to us.
+/// - `IpRecv` is used by gotatun to read IP packets that our netstack wants to send.
+#[derive(Clone)]
+struct IpLinkTx {
+    tx: mpsc::UnboundedSender<WgPacket<WgIp>>,
 }
 
-/// Encrypted WireGuard UDP datagram received from the network.
-struct EncryptedDatagram {
-    src: SocketAddr,
-    peer_idx: Option<usize>,
-    buf: crate::buffer::PooledSmallBuffer,
-    len: usize,
+struct IpLinkRx {
+    rx: mpsc::UnboundedReceiver<WgPacket<WgIp>>,
+    mtu: MtuWatcher,
 }
 
-/// Outbound (plain) IP packet that should be encapsulated for a specific peer.
-struct OutboundPacket {
-    peer_idx: usize,
-    packet: crate::netstack::PacketBuf,
+impl IpSend for IpLinkTx {
+    fn send(
+        &mut self,
+        packet: WgPacket<WgIp>,
+    ) -> impl std::future::Future<Output = io::Result<()>> + Send {
+        let res = self.tx.send(packet);
+        async move { res.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ip link closed")) }
+    }
 }
+
+impl IpRecv for IpLinkRx {
+    async fn recv<'a>(
+        &'a mut self,
+        _pool: &mut PacketBufPool,
+    ) -> io::Result<impl Iterator<Item = WgPacket<WgIp>> + Send + 'a> {
+        let Some(packet) = self.rx.recv().await else {
+            // The sender being dropped means our runtime is shutting down.
+            let () = std::future::pending().await;
+            unreachable!();
+        };
+        Ok(std::iter::once(packet))
+    }
+
+    fn mtu(&self) -> MtuWatcher {
+        self.mtu.clone()
+    }
+}
+
+type GotatunDevice = Device<(gotatun::udp::socket::UdpSocketFactory, IpLinkTx, IpLinkRx)>;
 
 #[derive(Clone)]
 pub struct WireguardRuntime {
@@ -221,39 +88,50 @@ pub struct WireguardRuntime {
 }
 
 struct Inner {
-    device_config: DeviceConfig,
-    /// Peer states - protected by RwLock for read-heavy access
-    peers: RwLock<PeerManager>,
-    /// UDP socket - Arc for sharing without lock
-    udp: Arc<UdpSocket>,
-    /// Channel for outbound datagrams (event-driven)
-    outbound_tx: mpsc::UnboundedSender<Datagram>,
-    /// Encrypted packets from the UDP socket to be decrypted.
-    decrypt_tx: mpsc::UnboundedSender<EncryptedDatagram>,
-    /// Plain IP packets from the netstack that should be encapsulated.
-    encrypt_tx: mpsc::UnboundedSender<OutboundPacket>,
-    /// Decrypted IP packets produced by crypto workers.
-    inbound_tx: mpsc::UnboundedSender<Vec<crate::netstack::PacketBuf>>,
+    /// gotatun WireGuard engine.
+    wg: GotatunDevice,
+
+    /// Channel that forwards outbound IP packets (from smoltcp) into gotatun.
+    tun_out_tx: mpsc::UnboundedSender<WgPacket<WgIp>>,
+
     /// Wakes the netstack poll loop when new work arrives.
     poll_notify: Notify,
+
     /// Wakes tasks waiting on socket readiness/state changes.
     io_notify: Notify,
-    /// Started flag
+
+    /// Started flag (kept for compatibility).
     started: AtomicBool,
+
     /// DNS servers
     dns_servers: Vec<IpAddr>,
+
     /// Private key for metrics
     private_key: [u8; 32],
+
     /// Listen port for metrics
     listen_port: Option<u16>,
+
     /// MTU
     #[allow(dead_code)]
     mtu: usize,
-    /// Buffer pool for reducing allocations
+
+    /// Buffer pool for reducing allocations in the smoltcp path.
     buffer_pool: Arc<BufferPool>,
+
+    /// A flattened view of all allowed IP networks, used for quick "has route" checks.
+    allowed_ips: Vec<ipnet::IpNet>,
 
     /// Control plane for netstack operations (connect/read/write/etc).
     netstack_cmd_tx: mpsc::UnboundedSender<NetstackCmd>,
+}
+
+impl Inner {
+    fn has_route_to(&self, ip: IpAddr) -> bool {
+        // Fast path: scan allowed IP networks.
+        // Peers are typically few, so this is fine.
+        self.allowed_ips.iter().any(|net| net.contains(&ip))
+    }
 }
 
 enum NetstackCmd {
@@ -298,29 +176,6 @@ enum NetstackCmd {
     },
 }
 
-struct PeerManager {
-    peers: Vec<PeerState>,
-    peer_by_endpoint: HashMap<SocketAddr, usize>,
-    allowed_ips: AllowedIps<usize>,
-}
-
-struct PeerState {
-    endpoint: SocketAddr,
-    tunn: Arc<Mutex<Tunn>>,
-    config: PeerConfig,
-}
-
-impl PeerState {
-    fn short_id(&self) -> String {
-        let b64 = BASE64_STD.encode(self.config.public_key);
-        if b64.len() >= 8 {
-            format!("({}…{})", &b64[..4], &b64[b64.len() - 4..])
-        } else {
-            format!("({})", b64)
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct WgTcpConnection {
     handle: Arc<std::sync::Mutex<Option<smoltcp::iface::SocketHandle>>>,
@@ -335,51 +190,87 @@ pub struct WgTcpListener {
 impl WireguardRuntime {
     pub async fn new(config: &DeviceConfig) -> anyhow::Result<Self> {
         let mtu = config.mtu;
+        let mtu_u16 = u16::try_from(mtu).unwrap_or(u16::MAX);
 
-        let udp = Arc::new(bind_udp_socket(config.listen_port).context("bind udp socket")?);
+        // Channels bridging gotatun <-> smoltcp.
+        // - gotatun -> netstack: decrypted IP packets
+        // - netstack -> gotatun: plaintext IP packets to encrypt
+        let (wg_to_tun_tx, wg_to_tun_rx) = mpsc::unbounded_channel::<WgPacket<WgIp>>();
+        let (tun_to_wg_tx, tun_to_wg_rx) = mpsc::unbounded_channel::<WgPacket<WgIp>>();
 
-        let mut peers = Vec::new();
-        let mut peer_by_endpoint = HashMap::new();
-        let mut allowed_ips = AllowedIps::new();
-
-        for (idx, peer) in config.peers.iter().enumerate() {
-            let endpoint = peer
-                .endpoint
-                .ok_or_else(|| anyhow::anyhow!("peer endpoint is required"))?;
-            let tunn = Arc::new(Mutex::new(build_tunn(config, peer)?));
-            for net in &peer.allowed_ips {
-                allowed_ips.insert(net.addr(), net.prefix_len() as u32, idx);
-            }
-            peer_by_endpoint.insert(endpoint, idx);
-            peers.push(PeerState {
-                endpoint,
-                tunn,
-                config: peer.clone(),
-            });
-        }
-
-        let peer_manager = PeerManager {
-            peers,
-            peer_by_endpoint,
-            allowed_ips,
+        let ip_tx = IpLinkTx { tx: wg_to_tun_tx };
+        let ip_rx = IpLinkRx {
+            rx: tun_to_wg_rx,
+            mtu: MtuWatcher::new(mtu_u16),
         };
 
-        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-        let (decrypt_tx, decrypt_rx) = mpsc::unbounded_channel();
-        let (encrypt_tx, encrypt_rx) = mpsc::unbounded_channel();
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let listen_port = config.listen_port.unwrap_or(0);
+        let wg = DeviceBuilder::new()
+            .with_default_udp()
+            .with_ip_pair(ip_tx, ip_rx)
+            .with_listen_port(listen_port)
+            .build()
+            .await
+            .context("build gotatun device")?;
+
+        // Configure device keys and peers.
+        // IMPORTANT: gotatun requires private key set before adding peers.
+        let private_key = x25519_dalek::StaticSecret::from(config.private_key);
+
+        let peers: Vec<WgPeer> = config
+            .peers
+            .iter()
+            .map(|peer| {
+                let endpoint = peer
+                    .endpoint
+                    .ok_or_else(|| anyhow::anyhow!("peer endpoint is required"))?;
+
+                let mut p = WgPeer::new(x25519_dalek::PublicKey::from(peer.public_key));
+                p.endpoint = Some(endpoint);
+
+                if peer.preshared_key != [0u8; 32] {
+                    p.preshared_key = Some(peer.preshared_key);
+                }
+
+                if peer.keepalive != 0 {
+                    p.keepalive = Some(peer.keepalive);
+                }
+
+                p.allowed_ips = peer
+                    .allowed_ips
+                    .iter()
+                    .map(|net| {
+                        // gotatun uses `ipnetwork::IpNetwork`.
+                        IpNetwork::new(net.addr(), net.prefix_len())
+                            .expect("cidr length already validated")
+                    })
+                    .collect();
+
+                Ok::<_, anyhow::Error>(p)
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Flatten allowed IPs for quick route checks.
+        let mut allowed_ips = Vec::new();
+        for peer in &config.peers {
+            allowed_ips.extend(peer.allowed_ips.iter().cloned());
+        }
+
+        wg.write(async |device| {
+            device.set_private_key(private_key).await;
+            device.clear_peers();
+            let _ = device.add_peers(peers);
+        })
+        .await
+        .context("configure gotatun device")?;
+
         let (netstack_cmd_tx, netstack_cmd_rx) = mpsc::unbounded_channel();
 
-        let buffer_pool = Arc::new(BufferPool::new(128, 64));
+        let buffer_pool = Arc::new(BufferPool::new(128));
 
         let inner = Arc::new(Inner {
-            device_config: config.clone(),
-            peers: RwLock::new(peer_manager),
-            udp: udp.clone(),
-            outbound_tx,
-            decrypt_tx,
-            encrypt_tx,
-            inbound_tx,
+            wg,
+            tun_out_tx: tun_to_wg_tx,
             poll_notify: Notify::new(),
             io_notify: Notify::new(),
             started: AtomicBool::new(false),
@@ -387,7 +278,8 @@ impl WireguardRuntime {
             private_key: config.private_key,
             listen_port: config.listen_port,
             mtu,
-            buffer_pool,
+            buffer_pool: Arc::clone(&buffer_pool),
+            allowed_ips,
             netstack_cmd_tx,
         });
 
@@ -396,16 +288,8 @@ impl WireguardRuntime {
             Arc::clone(&inner),
             netstack,
             netstack_cmd_rx,
-            inbound_rx,
+            wg_to_tun_rx,
         ));
-
-        // Spawn the event-driven outbound sender task
-        let udp_clone = udp.clone();
-        tokio::spawn(outbound_sender_loop(udp_clone, outbound_rx));
-
-        // Spawn worker pools.
-        spawn_decryption_workers(Arc::clone(&inner), decrypt_rx);
-        spawn_encryption_workers(Arc::clone(&inner), encrypt_rx);
 
         Ok(WireguardRuntime { inner })
     }
@@ -429,10 +313,9 @@ impl WireguardRuntime {
     }
 
     pub async fn metrics(&self) -> String {
-        // Use read lock for peers - no mutation needed
-        let peers = self.inner.peers.read();
-        let mut out = String::new();
+        let peers = self.inner.wg.read(async |dev| dev.peers().await).await;
 
+        let mut out = String::new();
         let _ = writeln!(&mut out, "protocol_version=1");
         let _ = writeln!(
             &mut out,
@@ -443,10 +326,8 @@ impl WireguardRuntime {
             let _ = writeln!(&mut out, "listen_port={}", port);
         }
 
-        for peer in &peers.peers {
-            let (last_handshake, tx_bytes, rx_bytes, _, _) = peer.tunn.lock().stats();
-
-            if let Some(since) = last_handshake
+        for peer in peers {
+            if let Some(since) = peer.stats.last_handshake
                 && let Some(when) = SystemTime::now().checked_sub(since)
                 && let Ok(delta) = when.duration_since(UNIX_EPOCH)
             {
@@ -457,8 +338,8 @@ impl WireguardRuntime {
                     delta.subsec_nanos()
                 );
             }
-            let _ = writeln!(&mut out, "rx_bytes={rx_bytes}");
-            let _ = writeln!(&mut out, "tx_bytes={tx_bytes}");
+            let _ = writeln!(&mut out, "rx_bytes={}", peer.stats.rx_bytes);
+            let _ = writeln!(&mut out, "tx_bytes={}", peer.stats.tx_bytes);
         }
 
         out
@@ -558,193 +439,9 @@ impl WireguardRuntime {
     }
 
     async fn start_tasks(&self) {
-        if self.inner.started.swap(true, Ordering::SeqCst) {
-            return;
-        }
-
-        let runtime = self.clone();
-        tokio::spawn(async move { runtime.udp_loop().await });
-
-        let runtime = self.clone();
-        tokio::spawn(async move { runtime.timer_loop().await });
-    }
-
-    // Netstack is handled by `netstack_loop` (single owner task).
-
-    async fn udp_loop(&self) {
-        // Receive WireGuard UDP packets. On Linux, use recvmmsg to amortize syscall costs.
-        #[cfg(target_os = "linux")]
-        {
-            use std::io;
-            use std::io::IoSliceMut;
-            use tokio::io::Interest;
-
-            use nix::sys::socket::{
-                MsgFlags, MultiHeaders, SockaddrLike, SockaddrStorage, recvmmsg,
-            };
-
-            const BATCH_SIZE: usize = 32;
-
-            let fd = self.inner.udp.as_raw_fd();
-
-            // Preallocate buffers once and reuse. We rebuild IoSliceMut wrappers on demand.
-            let mut bufs: Vec<Box<[u8; crate::buffer::WG_BUFFER_SIZE]>> = (0..BATCH_SIZE)
-                .map(|_| Box::new([0u8; crate::buffer::WG_BUFFER_SIZE]))
-                .collect();
-
-            loop {
-                // IMPORTANT: don't spin on `try_io` when the socket isn't ready.
-                // `readable().await` yields until the runtime observes readiness.
-                if let Err(err) = self.inner.udp.readable().await {
-                    log::error!("udp readiness error: {err}");
-                    continue;
-                }
-
-                // `MultiHeaders` (and the underlying `mmsghdr`) is `!Send` due to raw pointers.
-                // Create it after the await so this async fn remains `Send` and can be spawned.
-                let mut headers: MultiHeaders<SockaddrStorage> =
-                    MultiHeaders::preallocate(BATCH_SIZE, None);
-
-                // Drain as many datagrams as possible until we would block.
-                loop {
-                    let res = self.inner.udp.try_io(Interest::READABLE, || {
-                        // Rebuild IoSliceMut wrappers for recvmmsg.
-                        let mut iovecs: Vec<[IoSliceMut<'_>; 1]> = Vec::with_capacity(BATCH_SIZE);
-                        for buf in bufs.iter_mut() {
-                            iovecs.push([IoSliceMut::new(&mut buf[..])]);
-                        }
-
-                        let results = recvmmsg(
-                            fd,
-                            &mut headers,
-                            iovecs.iter_mut(),
-                            MsgFlags::MSG_DONTWAIT,
-                            None,
-                        )
-                        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-
-                        // `recvmmsg` yields `RecvMsg` values, each with a single iovec.
-                        for msg in results {
-                            let len = msg.bytes;
-                            if len == 0 {
-                                continue;
-                            }
-
-                            let Some(addr) = msg.address else {
-                                continue;
-                            };
-                            let src = match addr.family() {
-                                Some(nix::sys::socket::AddressFamily::Inet) => {
-                                    std::net::SocketAddr::from(*addr.as_sockaddr_in().unwrap())
-                                }
-                                Some(nix::sys::socket::AddressFamily::Inet6) => {
-                                    std::net::SocketAddr::from(*addr.as_sockaddr_in6().unwrap())
-                                }
-                                _ => continue,
-                            };
-
-                            let Some(data) = msg.iovs().next() else {
-                                continue;
-                            };
-
-                            if let Err(err) = self.handle_incoming(src, data) {
-                                log::error!("failed handling udp packet: {err:#}");
-                            }
-                        }
-
-                        Ok(())
-                    });
-
-                    match res {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                            // Readiness was false-positive or we've drained the socket.
-                            break;
-                        }
-                        Err(err) => {
-                            log::error!("udp recv error: {err}");
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            let mut buffer = self.inner.buffer_pool.get_large();
-            loop {
-                let (len, src) = match self.inner.udp.recv_from(&mut buffer[..]).await {
-                    Ok(result) => result,
-                    Err(err) => {
-                        log::error!("udp recv error: {err}");
-                        continue;
-                    }
-                };
-
-                if let Err(err) = self.handle_incoming(src, &buffer[..len]) {
-                    log::error!("failed handling udp packet: {err:#}");
-                }
-            }
-        }
-    }
-
-    async fn timer_loop(&self) {
-        loop {
-            {
-                let mut peers = self.inner.peers.write();
-                for peer in &mut peers.peers {
-                    // Allocate an output buffer from the pool and let boringtun write into it.
-                    let mut out = self.inner.buffer_pool.get_small();
-                    match peer.tunn.lock().update_timers(&mut out[..]) {
-                        TunnResult::WriteToNetwork(packet) => {
-                            let msg_type = if packet.len() >= 148 {
-                                "Sending handshake initiation"
-                            } else {
-                                "Sending keepalive packet"
-                            };
-                            log::debug!("peer{} - {}", peer.short_id(), msg_type);
-                            let len = packet.len();
-                            let _ = self.inner.outbound_tx.send(Datagram {
-                                endpoint: peer.endpoint,
-                                buf: out,
-                                len,
-                            });
-                        }
-                        TunnResult::Err(err) => {
-                            log::warn!("peer{} - timer error: {err:?}", peer.short_id());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            tokio::time::sleep(TIMER_INTERVAL).await;
-        }
-    }
-
-    /// Handle incoming UDP packet from WireGuard peer
-    fn handle_incoming(&self, src: SocketAddr, data: &[u8]) -> anyhow::Result<()> {
-        // Determine whether we can route this to a specific peer based on the endpoint.
-        // Even if this is wrong (roaming), the decrypt worker will fall back to scanning.
-        let peer_idx = {
-            let peers = self.inner.peers.read();
-            peers.peer_by_endpoint.get(&src).cloned()
-        };
-
-        // Own the buffer for the worker; the caller may reuse its receive buffer.
-        let mut buf = self.inner.buffer_pool.get_small();
-        let len = data.len().min(buf.len());
-        buf[..len].copy_from_slice(&data[..len]);
-
-        let _ = self.inner.decrypt_tx.send(EncryptedDatagram {
-            src,
-            peer_idx,
-            buf,
-            len,
-        });
-
-        Ok(())
+        // gotatun starts/stops its own tasks based on configuration.
+        // We keep this gate to preserve the old runtime contract.
+        let _ = self.inner.started.swap(true, Ordering::SeqCst);
     }
 }
 
@@ -755,8 +452,6 @@ impl WgTcpConnection {
             None => return Ok(0),
         };
 
-        // We pass an owned Vec through the netstack task so we don't keep borrowing across await.
-        // Since the cmd takes ownership, we re-create the Vec on the slow "would block" path.
         loop {
             let (reply_tx, reply_rx) = oneshot::channel();
             let _ = self
@@ -869,115 +564,6 @@ impl WgTcpListener {
     }
 }
 
-// ============ Event-driven outbound sender ============
-
-/// Event-driven outbound sender loop with Linux sendmmsg support
-async fn outbound_sender_loop(udp: Arc<UdpSocket>, mut rx: mpsc::UnboundedReceiver<Datagram>) {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-        let fd = udp.as_raw_fd();
-        let mut batch = Vec::with_capacity(64);
-
-        loop {
-            batch.clear();
-
-            // Wait for at least one datagram
-            match rx.recv().await {
-                Some(dg) => batch.push(dg),
-                None => break,
-            }
-
-            // Collect more without blocking (up to 64)
-            while batch.len() < 64 {
-                match rx.try_recv() {
-                    Ok(dg) => batch.push(dg),
-                    Err(_) => break,
-                }
-            }
-
-            if batch.len() == 1 {
-                let dg = &batch[0];
-                if let Err(e) = udp.send_to(&dg.buf[..dg.len], dg.endpoint).await {
-                    log::error!("udp send error: {e}");
-                }
-            } else {
-                // Batch send using sendmmsg
-                if let Err(e) = send_batch_linux(fd, &batch) {
-                    log::error!("sendmmsg error: {e}");
-                }
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        while let Some(dg) = rx.recv().await {
-            if let Err(e) = udp.send_to(&dg.buf[..dg.len], dg.endpoint).await {
-                log::error!("udp send error: {e}");
-            }
-        }
-    }
-}
-
-/// Linux sendmmsg batch send implementation
-#[cfg(target_os = "linux")]
-fn send_batch_linux(fd: std::os::fd::RawFd, batch: &[Datagram]) -> anyhow::Result<()> {
-    use nix::sys::socket::{MsgFlags, MultiHeaders, SockaddrStorage, sendmmsg};
-    use std::io::IoSlice;
-
-    // Build slices/addresses without reallocating on each call.
-    let mut iovecs: Vec<[IoSlice<'_>; 1]> = Vec::with_capacity(batch.len());
-    let mut addrs: Vec<Option<SockaddrStorage>> = Vec::with_capacity(batch.len());
-
-    for dg in batch {
-        addrs.push(Some(dg.endpoint.into()));
-        iovecs.push([IoSlice::new(&dg.buf[..dg.len])]);
-    }
-
-    // nix sendmmsg requires a preallocated MultiHeaders.
-    let mut data: MultiHeaders<SockaddrStorage> = MultiHeaders::preallocate(batch.len(), None);
-    let cmsgs: [nix::sys::socket::ControlMessage<'_>; 0] = [];
-
-    sendmmsg(fd, &mut data, &iovecs, &addrs, cmsgs, MsgFlags::empty())?;
-    Ok(())
-}
-
-// ============ Helper functions ============
-
-fn bind_udp_socket(listen_port: Option<u16>) -> anyhow::Result<UdpSocket> {
-    let port = listen_port.unwrap_or(0);
-    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_only_v6(false)?;
-    socket.bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port).into())?;
-    socket.set_nonblocking(true)?;
-    Ok(UdpSocket::from_std(socket.into())?)
-}
-
-fn build_tunn(device: &DeviceConfig, peer: &PeerConfig) -> anyhow::Result<Tunn> {
-    let private_key = StaticSecret::from(device.private_key);
-    let peer_public = PublicKey::from(peer.public_key);
-    let preshared = if peer.preshared_key == [0u8; 32] {
-        None
-    } else {
-        Some(peer.preshared_key)
-    };
-    let keepalive = if peer.keepalive == 0 {
-        None
-    } else {
-        Some(peer.keepalive)
-    };
-    let index: u32 = rand::random();
-    Ok(Tunn::new(
-        private_key,
-        peer_public,
-        preshared,
-        keepalive,
-        index,
-        None,
-    ))
-}
-
 fn encode_key(key: &[u8; 32]) -> String {
     BASE64_STD.encode(key)
 }
@@ -986,21 +572,6 @@ fn to_ip_address(addr: IpAddr) -> IpAddress {
     match addr {
         IpAddr::V4(v4) => IpAddress::Ipv4(v4),
         IpAddr::V6(v6) => IpAddress::Ipv6(v6),
-    }
-}
-
-fn dst_ip(packet: &[u8]) -> Option<IpAddr> {
-    let version = packet.first()? >> 4;
-    match version {
-        4 if packet.len() >= 20 => {
-            let octets: [u8; 4] = packet[16..20].try_into().ok()?;
-            Some(IpAddr::V4(Ipv4Addr::from(octets)))
-        }
-        6 if packet.len() >= 40 => {
-            let octets: [u8; 16] = packet[24..40].try_into().ok()?;
-            Some(IpAddr::V6(Ipv6Addr::from(octets)))
-        }
-        _ => None,
     }
 }
 
@@ -1046,72 +617,6 @@ fn matches_echo_reply(
     }
 }
 
-fn process_datagram(
-    peer: &Arc<Mutex<Tunn>>,
-    src: SocketAddr,
-    data: &[u8],
-    outbound_tx: &mpsc::UnboundedSender<Datagram>,
-    inbound: &mut Vec<crate::netstack::PacketBuf>,
-    buffer_pool: &Arc<BufferPool>,
-) -> bool {
-    // `decapsulate` writes into our buffer and returns slices that borrow from it.
-    // Keep `out_buf` alive for the duration of this function (until we turn it into PacketBuf).
-    let mut out_buf = buffer_pool.get_small();
-
-    let mut result = peer
-        .lock()
-        .decapsulate(Some(src.ip()), data, &mut out_buf[..]);
-
-    let mut flush = false;
-
-    loop {
-        match result {
-            TunnResult::WriteToNetwork(packet) => {
-                flush = true;
-
-                // Handshake response / keepalive etc.
-                // `packet` borrows from `out_buf`, so we can send `out_buf` directly.
-                let len = packet.len();
-                let _ = outbound_tx.send(Datagram {
-                    endpoint: src,
-                    buf: out_buf,
-                    len,
-                });
-
-                // Prepare a new buffer for any subsequent `WriteToNetwork`/`WriteToTunnel*` results.
-                out_buf = buffer_pool.get_small();
-                result = peer.lock().decapsulate(None, &[], &mut out_buf[..]);
-            }
-            TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                let len = packet.len();
-                inbound.push(crate::netstack::PacketBuf::new(out_buf, len));
-
-                // Flush pending queue after processing a packet that generated output.
-                if flush {
-                    out_buf = buffer_pool.get_small();
-                    result = peer.lock().decapsulate(None, &[], &mut out_buf[..]);
-                    flush = false;
-                    continue;
-                }
-
-                return true;
-            }
-            TunnResult::Done => {
-                // Flush pending queue after a packet that generated output.
-                if flush {
-                    out_buf = buffer_pool.get_small();
-                    result = peer.lock().decapsulate(None, &[], &mut out_buf[..]);
-                    flush = false;
-                    continue;
-                }
-
-                return true;
-            }
-            TunnResult::Err(_) => return false,
-        }
-    }
-}
-
 fn random_ephemeral_port() -> u16 {
     rand::random_range(49152..65535)
 }
@@ -1120,7 +625,7 @@ async fn netstack_loop(
     inner: Arc<Inner>,
     mut netstack: Netstack,
     mut cmd_rx: mpsc::UnboundedReceiver<NetstackCmd>,
-    mut inbound_rx: mpsc::UnboundedReceiver<Vec<crate::netstack::PacketBuf>>,
+    mut inbound_ip_rx: mpsc::UnboundedReceiver<WgPacket<WgIp>>,
 ) {
     type PendingConnect = (tokio::time::Instant, oneshot::Sender<anyhow::Result<()>>);
     type PendingUdp = (
@@ -1136,30 +641,34 @@ async fn netstack_loop(
         u16,
     );
 
-    // Track per-operation state so callers don't need to hold any locks.
     let mut pending_connects: HashMap<smoltcp::iface::SocketHandle, PendingConnect> =
         HashMap::new();
     let mut pending_udp: HashMap<smoltcp::iface::SocketHandle, PendingUdp> = HashMap::new();
     let mut pending_icmp: HashMap<smoltcp::iface::SocketHandle, PendingIcmp> = HashMap::new();
 
     loop {
-        // Fast-path: apply decrypted inbound packets.
-        while let Ok(batch) = inbound_rx.try_recv() {
-            for packet in batch {
-                netstack.push_inbound(packet);
+        // Drain inbound IP packets produced by gotatun (decrypted WG payloads).
+        while let Ok(packet) = inbound_ip_rx.try_recv() {
+            let bytes: &[u8] = &packet.into_bytes();
+            if bytes.is_empty() {
+                continue;
             }
+
+            // Note: Netstack stores fixed-size pooled buffers; we copy into it.
+            let mut buf = inner.buffer_pool.get_small();
+            let len = bytes.len().min(buf.len());
+            buf[..len].copy_from_slice(&bytes[..len]);
+            netstack.push_inbound(PacketBuf::new(buf, len));
         }
 
-        // Drain commands without blocking. We keep this bounded implicitly by how many are queued.
+        // Drain commands without blocking.
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 NetstackCmd::TcpConnect { remote, reply } => {
                     let result = (|| {
-                        let peers = inner.peers.read();
-                        if peers.allowed_ips.find(remote.ip()).is_none() {
+                        if !inner.has_route_to(remote.ip()) {
                             anyhow::bail!("no peer for destination {remote}");
                         }
-                        drop(peers);
 
                         let rx = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER]);
                         let tx = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER]);
@@ -1393,29 +902,29 @@ async fn netstack_loop(
             }
         }
 
-        // Run one poll step and dispatch outbound frames.
+        // Run one poll step.
         let did_work = netstack.poll();
-        let frames = netstack.drain_outbound();
         if did_work {
             inner.io_notify.notify_waiters();
         }
-        if !frames.is_empty() {
-            // Send frames for encryption.
-            let peers = inner.peers.read();
-            for frame in frames {
-                let frame_bytes = frame.as_slice();
-                let dst = match dst_ip(frame_bytes) {
-                    Some(dst) => dst,
-                    None => continue,
-                };
-                let Some(peer_idx) = peers.allowed_ips.find(dst).cloned() else {
-                    continue;
-                };
-                let _ = inner.encrypt_tx.send(OutboundPacket {
-                    peer_idx,
-                    packet: frame,
-                });
+
+        // Forward outbound frames (generated by smoltcp) into gotatun.
+        let frames = netstack.drain_outbound();
+        for frame in frames {
+            let bytes = frame.as_slice();
+            if bytes.is_empty() {
+                continue;
             }
+
+            let mut backing = BytesMut::with_capacity(bytes.len());
+            backing.extend_from_slice(bytes);
+
+            let packet = match WgPacket::from_bytes(backing).try_into_ip() {
+                Ok(packet) => packet,
+                Err(_) => continue,
+            };
+
+            let _ = inner.tun_out_tx.send(packet);
         }
 
         // Progress pending connect/readiness-style operations.
