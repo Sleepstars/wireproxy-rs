@@ -10,8 +10,15 @@ NC='\033[0m'
 GO_CONFIG_FILE="/tmp/wireproxy_go.conf"
 RS_CONFIG_FILE="/tmp/wireproxy_rs.conf"
 RESULTS_FILE="/tmp/benchmark_results.json"
-DURATION=180
-WARMUP=5
+DURATION=${DURATION:-180}
+WARMUP=${WARMUP:-5}
+
+CONFIG_FILE=${CONFIG_FILE:-"/tmp/wireproxy.conf"}
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo -e "${RED}Config not found: $CONFIG_FILE${NC}"
+    echo -e "${YELLOW}Set CONFIG_FILE=/path/to/wireproxy.conf and rerun.${NC}"
+    exit 1
+fi
 
 # Different ports for parallel testing
 GO_SOCKS_PORT=1080
@@ -41,7 +48,7 @@ create_config() {
 
     # Read base config and modify SOCKS5 port
     sed "s/BindAddress = 127.0.0.1:1080/BindAddress = 127.0.0.1:$socks_port/" \
-        /tmp/wireproxy.conf > "$config_file"
+        "$CONFIG_FILE" > "$config_file"
 }
 
 create_config "$GO_CONFIG_FILE" "$GO_SOCKS_PORT"

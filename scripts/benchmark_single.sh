@@ -13,9 +13,15 @@ if [ -z "$IMPL" ]; then
     exit 1
 fi
 
-CONFIG_FILE="/tmp/wireproxy.conf"
-DURATION=180
-WARMUP=5
+CONFIG_FILE=${CONFIG_FILE:-"/tmp/wireproxy.conf"}
+DURATION=${DURATION:-180}
+WARMUP=${WARMUP:-5}
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo -e "${RED}Config not found: $CONFIG_FILE${NC}"
+    echo -e "${YELLOW}Set CONFIG_FILE=/path/to/wireproxy.conf and rerun.${NC}"
+    exit 1
+fi
 
 echo -e "${GREEN}=== WireProxy Benchmark: $IMPL ===${NC}"
 
