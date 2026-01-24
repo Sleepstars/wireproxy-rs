@@ -3,7 +3,7 @@ use std::fmt::Write;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -38,6 +38,18 @@ const UDP_TX_BUFFER: usize = 2048;
 const ICMP_RX_BUFFER: usize = 256;
 const ICMP_TX_BUFFER: usize = 256;
 
+fn auto_netstack_shards() -> usize {
+    // Keep this automatic to match upstream wireproxy's "no extra config knobs" philosophy.
+    //
+    // We cap the shard count so each shard still has a reasonably-sized slice of the
+    // ephemeral port range (we partition ports by shard to route inbound packets back
+    // to the owning smoltcp instance).
+    let cpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    cpu.clamp(1, 32)
+}
+
 type PendingConnect = (tokio::time::Instant, oneshot::Sender<anyhow::Result<()>>);
 
 type PendingUdp = (
@@ -60,7 +72,7 @@ type PendingIcmp = (
 /// - `IpRecv` is used by gotatun to read IP packets that our netstack wants to send.
 #[derive(Clone)]
 struct IpLinkTx {
-    tx: mpsc::UnboundedSender<WgPacket<WgIp>>,
+    shard_txs: Arc<Vec<mpsc::UnboundedSender<WgPacket<WgIp>>>>,
 }
 
 struct IpLinkRx {
@@ -73,8 +85,24 @@ impl IpSend for IpLinkTx {
         &mut self,
         packet: WgPacket<WgIp>,
     ) -> impl std::future::Future<Output = io::Result<()>> + Send {
-        let res = self.tx.send(packet);
-        async move { res.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ip link closed")) }
+        // We need a byte view to shard based on L4 destination port.
+        // `Packet::into_bytes` does not allocate; it just erases the marker type.
+        let raw = packet.into_bytes();
+        let bytes: &[u8] = &raw;
+        let shard = pick_inbound_shard(bytes, self.shard_txs.len());
+
+        let res = (|| {
+            let ip = raw
+                .try_into_ip()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid ip packet"))?;
+            self.shard_txs
+                .get(shard)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ip link closed"))?
+                .send(ip)
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ip link closed"))?;
+            Ok(())
+        })();
+        async move { res }
     }
 }
 
@@ -88,11 +116,107 @@ impl IpRecv for IpLinkRx {
             let () = std::future::pending().await;
             unreachable!();
         };
-        Ok(std::iter::once(packet))
+
+        // Batch a bit to reduce channel overhead on hot paths.
+        // gotatun will further buffer on its side.
+        let mut buf = Vec::with_capacity(32);
+        buf.push(packet);
+        for _ in 0..31 {
+            match self.rx.try_recv() {
+                Ok(p) => buf.push(p),
+                Err(_) => break,
+            }
+        }
+
+        Ok(buf.into_iter())
     }
 
     fn mtu(&self) -> MtuWatcher {
         self.mtu.clone()
+    }
+}
+
+fn ipv4_dest_port(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 20 {
+        return None;
+    }
+    // IHL is in 32-bit words.
+    let ihl_bytes = usize::from(bytes[0] & 0x0f) * 4;
+    if ihl_bytes < 20 || ihl_bytes > bytes.len() {
+        return None;
+    }
+    let proto = bytes[9];
+    if proto != 6 && proto != 17 {
+        return None;
+    }
+    let off = ihl_bytes + 2;
+    if off + 2 > bytes.len() {
+        return None;
+    }
+    Some(u16::from_be_bytes([bytes[off], bytes[off + 1]]))
+}
+
+fn ipv6_dest_port(bytes: &[u8]) -> Option<u16> {
+    // Base IPv6 header is 40 bytes.
+    if bytes.len() < 40 {
+        return None;
+    }
+    let mut next = bytes[6];
+    let mut off = 40usize;
+
+    // Best-effort parse of extension header chain to find TCP/UDP.
+    // We cap iterations to avoid pathological packets.
+    for _ in 0..8 {
+        if next == 6 || next == 17 {
+            let port_off = off + 2;
+            if port_off + 2 > bytes.len() {
+                return None;
+            }
+            return Some(u16::from_be_bytes([bytes[port_off], bytes[port_off + 1]]));
+        }
+
+        // Hop-by-hop(0), Routing(43), Destination Options(60): len in 8-octet units minus 1.
+        if next == 0 || next == 43 || next == 60 {
+            if off + 2 > bytes.len() {
+                return None;
+            }
+            let hdr_len = (usize::from(bytes[off + 1]) + 1) * 8;
+            next = bytes[off];
+            off = off.saturating_add(hdr_len);
+            continue;
+        }
+
+        // Fragment header(44) is always 8 bytes.
+        if next == 44 {
+            if off + 8 > bytes.len() {
+                return None;
+            }
+            next = bytes[off];
+            off = off.saturating_add(8);
+            continue;
+        }
+
+        // Unknown/unsupported extension; give up.
+        return None;
+    }
+
+    None
+}
+
+fn pick_inbound_shard(bytes: &[u8], shards: usize) -> usize {
+    if shards <= 1 {
+        return 0;
+    }
+    let ver = bytes.first().map(|b| b >> 4).unwrap_or(0);
+    let port = match ver {
+        4 => ipv4_dest_port(bytes),
+        6 => ipv6_dest_port(bytes),
+        _ => None,
+    };
+
+    match port {
+        Some(p) => (p as usize) % shards,
+        None => 0,
     }
 }
 
@@ -103,18 +227,18 @@ pub struct WireguardRuntime {
     inner: Arc<Inner>,
 }
 
+struct NetstackShard {
+    cmd_tx: mpsc::UnboundedSender<NetstackCmd>,
+    /// Wakes tasks waiting on socket readiness/state changes for this shard.
+    io_notify: Arc<Notify>,
+}
+
 struct Inner {
     /// gotatun WireGuard engine.
     wg: GotatunDevice,
 
     /// Channel that forwards outbound IP packets (from smoltcp) into gotatun.
     tun_out_tx: mpsc::UnboundedSender<WgPacket<WgIp>>,
-
-    /// Wakes the netstack poll loop when new work arrives.
-    poll_notify: Notify,
-
-    /// Wakes tasks waiting on socket readiness/state changes.
-    io_notify: Notify,
 
     /// Started flag (kept for compatibility).
     started: AtomicBool,
@@ -138,8 +262,11 @@ struct Inner {
     /// A flattened view of all allowed IP networks, used for quick "has route" checks.
     allowed_ips: Vec<ipnet::IpNet>,
 
-    /// Control plane for netstack operations (connect/read/write/etc).
-    netstack_cmd_tx: mpsc::UnboundedSender<NetstackCmd>,
+    /// Independent smoltcp netstack shards.
+    shards: Vec<NetstackShard>,
+
+    /// Round-robin shard selection for new flows.
+    next_shard: AtomicUsize,
 }
 
 impl Inner {
@@ -147,6 +274,22 @@ impl Inner {
         // Fast path: scan allowed IP networks.
         // Peers are typically few, so this is fine.
         self.allowed_ips.iter().any(|net| net.contains(&ip))
+    }
+
+    fn shard_for_port(&self, port: u16) -> usize {
+        let n = self.shards.len();
+        if n <= 1 {
+            return 0;
+        }
+        (port as usize) % n
+    }
+
+    fn pick_shard_round_robin(&self) -> usize {
+        let n = self.shards.len();
+        if n <= 1 {
+            return 0;
+        }
+        self.next_shard.fetch_add(1, Ordering::Relaxed) % n
     }
 }
 
@@ -196,6 +339,7 @@ enum NetstackCmd {
 pub struct WgTcpConnection {
     handle: Arc<std::sync::Mutex<Option<smoltcp::iface::SocketHandle>>>,
     runtime: WireguardRuntime,
+    shard: usize,
 }
 
 pub struct WgTcpListener {
@@ -208,13 +352,27 @@ impl WireguardRuntime {
         let mtu = config.mtu;
         let mtu_u16 = u16::try_from(mtu).unwrap_or(u16::MAX);
 
+        let shard_count = auto_netstack_shards();
+        let cpu = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        log::info!("using {shard_count} netstack shard(s) (cpu={cpu}, cap=32)");
+
         // Channels bridging gotatun <-> smoltcp.
         // - gotatun -> netstack: decrypted IP packets
         // - netstack -> gotatun: plaintext IP packets to encrypt
-        let (wg_to_tun_tx, wg_to_tun_rx) = mpsc::unbounded_channel::<WgPacket<WgIp>>();
+        let mut wg_to_tun_txs = Vec::with_capacity(shard_count);
+        let mut wg_to_tun_rxs = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
+            let (tx, rx) = mpsc::unbounded_channel::<WgPacket<WgIp>>();
+            wg_to_tun_txs.push(tx);
+            wg_to_tun_rxs.push(rx);
+        }
         let (tun_to_wg_tx, tun_to_wg_rx) = mpsc::unbounded_channel::<WgPacket<WgIp>>();
 
-        let ip_tx = IpLinkTx { tx: wg_to_tun_tx };
+        let ip_tx = IpLinkTx {
+            shard_txs: Arc::new(wg_to_tun_txs),
+        };
         let ip_rx = IpLinkRx {
             rx: tun_to_wg_rx,
             mtu: MtuWatcher::new(mtu_u16),
@@ -280,15 +438,22 @@ impl WireguardRuntime {
         .await
         .context("configure gotatun device")?;
 
-        let (netstack_cmd_tx, netstack_cmd_rx) = mpsc::unbounded_channel();
-
         let buffer_pool = Arc::new(BufferPool::new(128));
+
+        let mut shard_cmd_rxs = Vec::with_capacity(shard_count);
+        let mut shards = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
+            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            shard_cmd_rxs.push(cmd_rx);
+            shards.push(NetstackShard {
+                cmd_tx,
+                io_notify: Arc::new(Notify::new()),
+            });
+        }
 
         let inner = Arc::new(Inner {
             wg,
             tun_out_tx: tun_to_wg_tx,
-            poll_notify: Notify::new(),
-            io_notify: Notify::new(),
             started: AtomicBool::new(false),
             dns_servers: config.dns.clone(),
             private_key: config.private_key,
@@ -296,16 +461,27 @@ impl WireguardRuntime {
             mtu,
             buffer_pool: Arc::clone(&buffer_pool),
             allowed_ips,
-            netstack_cmd_tx,
+            shards,
+            next_shard: AtomicUsize::new(0),
         });
 
-        let netstack = Netstack::new(&config.addresses, mtu, Arc::clone(&inner.buffer_pool));
-        tokio::spawn(netstack_loop(
-            Arc::clone(&inner),
-            netstack,
-            netstack_cmd_rx,
-            wg_to_tun_rx,
-        ));
+        for (shard_id, (cmd_rx, inbound_rx)) in shard_cmd_rxs
+            .into_iter()
+            .zip(wg_to_tun_rxs.into_iter())
+            .enumerate()
+        {
+            let io_notify = Arc::clone(&inner.shards[shard_id].io_notify);
+            let netstack = Netstack::new(&config.addresses, mtu, Arc::clone(&inner.buffer_pool));
+            tokio::spawn(netstack_loop(
+                shard_id,
+                shard_count,
+                Arc::clone(&inner),
+                io_notify,
+                netstack,
+                cmd_rx,
+                inbound_rx,
+            ));
+        }
 
         Ok(WireguardRuntime { inner })
     }
@@ -363,12 +539,13 @@ impl WireguardRuntime {
 
     pub async fn ping(&self, target: IpAddr, timeout: Duration) -> anyhow::Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.inner.netstack_cmd_tx.send(NetstackCmd::IcmpPing {
+        // ICMP does not have ports, so inbound echo replies are routed to shard 0.
+        let shard = 0;
+        let _ = self.inner.shards[shard].cmd_tx.send(NetstackCmd::IcmpPing {
             target,
             timeout,
             reply: reply_tx,
         });
-        self.inner.poll_notify.notify_one();
         reply_rx
             .await
             .map_err(|_| anyhow::anyhow!("netstack task dropped ping"))??;
@@ -377,11 +554,13 @@ impl WireguardRuntime {
 
     pub async fn connect(&self, addr: SocketAddr) -> anyhow::Result<WgTcpConnection> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.inner.netstack_cmd_tx.send(NetstackCmd::TcpConnect {
-            remote: addr,
-            reply: reply_tx,
-        });
-        self.inner.poll_notify.notify_one();
+        let shard = self.inner.pick_shard_round_robin();
+        let _ = self.inner.shards[shard]
+            .cmd_tx
+            .send(NetstackCmd::TcpConnect {
+                remote: addr,
+                reply: reply_tx,
+            });
         let handle = reply_rx
             .await
             .map_err(|_| anyhow::anyhow!("netstack task dropped tcp connect"))??;
@@ -389,6 +568,7 @@ impl WireguardRuntime {
         let mut conn = WgTcpConnection {
             handle: Arc::new(std::sync::Mutex::new(Some(handle))),
             runtime: self.clone(),
+            shard,
         };
         conn.wait_established().await?;
         Ok(conn)
@@ -402,12 +582,14 @@ impl WireguardRuntime {
     }
 
     pub async fn accept(&self, port: u16) -> anyhow::Result<WgTcpConnection> {
+        let shard = self.inner.shard_for_port(port);
         let (listen_tx, listen_rx) = oneshot::channel();
-        let _ = self.inner.netstack_cmd_tx.send(NetstackCmd::TcpListen {
-            port,
-            reply: listen_tx,
-        });
-        self.inner.poll_notify.notify_one();
+        let _ = self.inner.shards[shard]
+            .cmd_tx
+            .send(NetstackCmd::TcpListen {
+                port,
+                reply: listen_tx,
+            });
         let handle = listen_rx
             .await
             .map_err(|_| anyhow::anyhow!("netstack task dropped tcp listen"))??;
@@ -416,15 +598,13 @@ impl WireguardRuntime {
         // This mirrors the previous (simplified) behavior.
         let (wait_tx, wait_rx) = oneshot::channel();
         let deadline = tokio::time::Instant::now() + TCP_CONNECT_TIMEOUT;
-        let _ = self
-            .inner
-            .netstack_cmd_tx
+        let _ = self.inner.shards[shard]
+            .cmd_tx
             .send(NetstackCmd::TcpWaitEstablished {
                 handle,
                 deadline,
                 reply: wait_tx,
             });
-        self.inner.poll_notify.notify_one();
         wait_rx
             .await
             .map_err(|_| anyhow::anyhow!("netstack task dropped tcp accept"))??;
@@ -432,6 +612,7 @@ impl WireguardRuntime {
         Ok(WgTcpConnection {
             handle: Arc::new(std::sync::Mutex::new(Some(handle))),
             runtime: self.clone(),
+            shard,
         })
     }
 
@@ -442,13 +623,15 @@ impl WireguardRuntime {
     ) -> anyhow::Result<Vec<u8>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let deadline = tokio::time::Instant::now() + DNS_TIMEOUT;
-        let _ = self.inner.netstack_cmd_tx.send(NetstackCmd::UdpExchange {
-            target,
-            payload: payload.to_vec(),
-            deadline,
-            reply: reply_tx,
-        });
-        self.inner.poll_notify.notify_one();
+        let shard = self.inner.pick_shard_round_robin();
+        let _ = self.inner.shards[shard]
+            .cmd_tx
+            .send(NetstackCmd::UdpExchange {
+                target,
+                payload: payload.to_vec(),
+                deadline,
+                reply: reply_tx,
+            });
         reply_rx
             .await
             .map_err(|_| anyhow::anyhow!("netstack task dropped udp exchange"))?
@@ -470,16 +653,13 @@ impl WgTcpConnection {
 
         loop {
             let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = self
-                .runtime
-                .inner
-                .netstack_cmd_tx
+            let _ = self.runtime.inner.shards[self.shard]
+                .cmd_tx
                 .send(NetstackCmd::TcpRead {
                     handle,
                     buf: vec![0u8; buf.len()],
                     reply: reply_tx,
                 });
-            self.runtime.inner.poll_notify.notify_one();
 
             let result = reply_rx
                 .await
@@ -491,7 +671,10 @@ impl WgTcpConnection {
                     return Ok(n);
                 }
                 Err(err) if err.to_string().contains("would block") => {
-                    self.runtime.inner.io_notify.notified().await;
+                    self.runtime.inner.shards[self.shard]
+                        .io_notify
+                        .notified()
+                        .await;
                 }
                 Err(err) => return Err(err),
             }
@@ -507,16 +690,13 @@ impl WgTcpConnection {
         let mut offset = 0;
         while offset < buf.len() {
             let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = self
-                .runtime
-                .inner
-                .netstack_cmd_tx
+            let _ = self.runtime.inner.shards[self.shard]
+                .cmd_tx
                 .send(NetstackCmd::TcpWrite {
                     handle,
                     data: buf[offset..].to_vec(),
                     reply: reply_tx,
                 });
-            self.runtime.inner.poll_notify.notify_one();
 
             match reply_rx
                 .await
@@ -526,7 +706,10 @@ impl WgTcpConnection {
                     offset += n;
                 }
                 Err(err) if err.to_string().contains("would block") => {
-                    self.runtime.inner.io_notify.notified().await;
+                    self.runtime.inner.shards[self.shard]
+                        .io_notify
+                        .notified()
+                        .await;
                 }
                 Err(err) => return Err(err),
             }
@@ -540,12 +723,9 @@ impl WgTcpConnection {
             Some(h) => h,
             None => return,
         };
-        let _ = self
-            .runtime
-            .inner
-            .netstack_cmd_tx
+        let _ = self.runtime.inner.shards[self.shard]
+            .cmd_tx
             .send(NetstackCmd::TcpClose { handle });
-        self.runtime.inner.poll_notify.notify_one();
     }
 
     async fn wait_established(&mut self) -> anyhow::Result<()> {
@@ -556,16 +736,14 @@ impl WgTcpConnection {
 
         let (reply_tx, reply_rx) = oneshot::channel();
         let deadline = tokio::time::Instant::now() + TCP_CONNECT_TIMEOUT;
-        let _ = self
-            .runtime
-            .inner
-            .netstack_cmd_tx
-            .send(NetstackCmd::TcpWaitEstablished {
-                handle,
-                deadline,
-                reply: reply_tx,
-            });
-        self.runtime.inner.poll_notify.notify_one();
+        let _ =
+            self.runtime.inner.shards[self.shard]
+                .cmd_tx
+                .send(NetstackCmd::TcpWaitEstablished {
+                    handle,
+                    deadline,
+                    reply: reply_tx,
+                });
 
         reply_rx
             .await
@@ -633,8 +811,27 @@ fn matches_echo_reply(
     }
 }
 
-fn random_ephemeral_port() -> u16 {
-    rand::random_range(49152..65535)
+fn random_ephemeral_port(shard_id: usize, shards: usize) -> u16 {
+    debug_assert!(shards >= 1);
+    if shards <= 1 {
+        return rand::random_range(49152..65535);
+    }
+
+    // IANA ephemeral port range (inclusive)
+    let min = 49152usize;
+    let max = 65535usize;
+
+    let sid = shard_id % shards;
+
+    // First port in [min, max] such that port % shards == sid
+    let first = min + ((sid + shards - (min % shards)) % shards);
+    if first > max {
+        return rand::random_range(49152..65535);
+    }
+    let count = ((max - first) / shards) + 1;
+
+    let idx = rand::random_range(0..count);
+    (first + idx * shards) as u16
 }
 
 fn push_inbound_packet(inner: &Inner, netstack: &mut Netstack, packet: WgPacket<WgIp>) {
@@ -650,14 +847,25 @@ fn push_inbound_packet(inner: &Inner, netstack: &mut Netstack, packet: WgPacket<
     netstack.push_inbound(PacketBuf::new(buf, len));
 }
 
-fn handle_netstack_cmd(
-    inner: &Inner,
-    netstack: &mut Netstack,
-    pending_connects: &mut HashMap<smoltcp::iface::SocketHandle, PendingConnect>,
-    pending_udp: &mut HashMap<smoltcp::iface::SocketHandle, PendingUdp>,
-    pending_icmp: &mut HashMap<smoltcp::iface::SocketHandle, PendingIcmp>,
-    cmd: NetstackCmd,
-) {
+struct NetstackLoopCtx<'a> {
+    inner: &'a Inner,
+    netstack: &'a mut Netstack,
+    pending_connects: &'a mut HashMap<smoltcp::iface::SocketHandle, PendingConnect>,
+    pending_udp: &'a mut HashMap<smoltcp::iface::SocketHandle, PendingUdp>,
+    pending_icmp: &'a mut HashMap<smoltcp::iface::SocketHandle, PendingIcmp>,
+    shard_id: usize,
+    shard_count: usize,
+}
+
+fn handle_netstack_cmd(ctx: &mut NetstackLoopCtx<'_>, cmd: NetstackCmd) {
+    let inner = ctx.inner;
+    let netstack = &mut *ctx.netstack;
+    let pending_connects = &mut *ctx.pending_connects;
+    let pending_udp = &mut *ctx.pending_udp;
+    let pending_icmp = &mut *ctx.pending_icmp;
+    let shard_id = ctx.shard_id;
+    let shard_count = ctx.shard_count;
+
     match cmd {
         NetstackCmd::TcpConnect { remote, reply } => {
             let result = (|| {
@@ -671,7 +879,7 @@ fn handle_netstack_cmd(
                 socket.set_nagle_enabled(false);
 
                 let handle = netstack.add_socket(socket);
-                let local_port = random_ephemeral_port();
+                let local_port = random_ephemeral_port(shard_id, shard_count);
                 netstack
                     .tcp_connect(
                         handle,
@@ -682,7 +890,6 @@ fn handle_netstack_cmd(
                 Ok(handle)
             })();
             let _ = reply.send(result);
-            inner.poll_notify.notify_one();
         }
         NetstackCmd::TcpListen { port, reply } => {
             let result = (|| {
@@ -695,7 +902,6 @@ fn handle_netstack_cmd(
                 Ok(netstack.add_socket(socket))
             })();
             let _ = reply.send(result);
-            inner.poll_notify.notify_one();
         }
         NetstackCmd::TcpWaitEstablished {
             handle,
@@ -703,7 +909,6 @@ fn handle_netstack_cmd(
             reply,
         } => {
             pending_connects.insert(handle, (deadline, reply));
-            inner.poll_notify.notify_one();
         }
         NetstackCmd::TcpRead {
             handle,
@@ -739,7 +944,6 @@ fn handle_netstack_cmd(
                     let written = socket
                         .send_slice(&data)
                         .map_err(|e| anyhow::anyhow!("tcp send error: {e:?}"))?;
-                    inner.poll_notify.notify_one();
                     return Ok(written);
                 }
                 anyhow::bail!("would block")
@@ -752,7 +956,6 @@ fn handle_netstack_cmd(
                 socket.close();
             }
             netstack.sockets.remove(handle);
-            inner.poll_notify.notify_one();
         }
 
         NetstackCmd::UdpExchange {
@@ -771,7 +974,7 @@ fn handle_netstack_cmd(
                     vec![0u8; UDP_TX_BUFFER],
                 );
                 let mut socket = udp::Socket::new(rx, tx);
-                let local_port = random_ephemeral_port();
+                let local_port = random_ephemeral_port(shard_id, shard_count);
                 socket
                     .bind(IpListenEndpoint::from(local_port))
                     .map_err(|e| anyhow::anyhow!("udp bind error: {e:?}"))?;
@@ -789,7 +992,6 @@ fn handle_netstack_cmd(
             match result {
                 Ok(handle) => {
                     pending_udp.insert(handle, (deadline, reply));
-                    inner.poll_notify.notify_one();
                 }
                 Err(err) => {
                     let _ = reply.send(Err(err));
@@ -885,7 +1087,6 @@ fn handle_netstack_cmd(
                         handle,
                         (deadline, reply, target_addr, v6_src, ident, seq_no),
                     );
-                    inner.poll_notify.notify_one();
                 }
                 Err(err) => {
                     let _ = reply.send(Err(err));
@@ -896,7 +1097,10 @@ fn handle_netstack_cmd(
 }
 
 async fn netstack_loop(
+    shard_id: usize,
+    shard_count: usize,
     inner: Arc<Inner>,
+    io_notify: Arc<Notify>,
     mut netstack: Netstack,
     mut cmd_rx: mpsc::UnboundedReceiver<NetstackCmd>,
     mut inbound_ip_rx: mpsc::UnboundedReceiver<WgPacket<WgIp>>,
@@ -914,20 +1118,22 @@ async fn netstack_loop(
 
         // Drain commands without blocking.
         while let Ok(cmd) = cmd_rx.try_recv() {
-            handle_netstack_cmd(
-                inner.as_ref(),
-                &mut netstack,
-                &mut pending_connects,
-                &mut pending_udp,
-                &mut pending_icmp,
-                cmd,
-            );
+            let mut ctx = NetstackLoopCtx {
+                inner: inner.as_ref(),
+                netstack: &mut netstack,
+                pending_connects: &mut pending_connects,
+                pending_udp: &mut pending_udp,
+                pending_icmp: &mut pending_icmp,
+                shard_id,
+                shard_count,
+            };
+            handle_netstack_cmd(&mut ctx, cmd);
         }
 
         // Run one poll step.
         let did_work = netstack.poll();
         if did_work {
-            inner.io_notify.notify_waiters();
+            io_notify.notify_waiters();
         }
 
         // Forward outbound frames (generated by smoltcp) into gotatun.
@@ -1055,8 +1261,8 @@ async fn netstack_loop(
         // Sleep/yield until new work.
         //
         // Important: inbound decrypted packets arrive on `inbound_ip_rx`.
-        // If we only wait on `poll_notify`, inbound packets can sit in the channel
-        // and smoltcp never sees them.
+        // We must wake on inbound packets and commands; otherwise smoltcp never
+        // sees decrypted payloads and handshakes can stall.
         //
         // Also, smoltcp's `poll_delay()` does not know about our own user-level
         // deadlines (connect/udp/icmp timeouts), so we must wake for those too.
@@ -1082,7 +1288,6 @@ async fn netstack_loop(
             Some(d) => {
                 tokio::select! {
                     biased;
-                    _ = inner.poll_notify.notified() => {},
                     packet = inbound_ip_rx.recv() => {
                         let Some(packet) = packet else {
                             return;
@@ -1093,14 +1298,16 @@ async fn netstack_loop(
                         let Some(cmd) = cmd else {
                             return;
                         };
-                        handle_netstack_cmd(
-                            inner.as_ref(),
-                            &mut netstack,
-                            &mut pending_connects,
-                            &mut pending_udp,
-                            &mut pending_icmp,
-                            cmd,
-                        );
+                        let mut ctx = NetstackLoopCtx {
+                            inner: inner.as_ref(),
+                            netstack: &mut netstack,
+                            pending_connects: &mut pending_connects,
+                            pending_udp: &mut pending_udp,
+                            pending_icmp: &mut pending_icmp,
+                            shard_id,
+                            shard_count,
+                        };
+                        handle_netstack_cmd(&mut ctx, cmd);
                     }
                     _ = tokio::time::sleep(d) => {},
                 }
@@ -1108,7 +1315,6 @@ async fn netstack_loop(
             None => {
                 tokio::select! {
                     biased;
-                    _ = inner.poll_notify.notified() => {},
                     packet = inbound_ip_rx.recv() => {
                         let Some(packet) = packet else {
                             return;
@@ -1119,14 +1325,16 @@ async fn netstack_loop(
                         let Some(cmd) = cmd else {
                             return;
                         };
-                        handle_netstack_cmd(
-                            inner.as_ref(),
-                            &mut netstack,
-                            &mut pending_connects,
-                            &mut pending_udp,
-                            &mut pending_icmp,
-                            cmd,
-                        );
+                        let mut ctx = NetstackLoopCtx {
+                            inner: inner.as_ref(),
+                            netstack: &mut netstack,
+                            pending_connects: &mut pending_connects,
+                            pending_udp: &mut pending_udp,
+                            pending_icmp: &mut pending_icmp,
+                            shard_id,
+                            shard_count,
+                        };
+                        handle_netstack_cmd(&mut ctx, cmd);
                     }
                 }
             }

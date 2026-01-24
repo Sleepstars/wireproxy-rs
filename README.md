@@ -1,7 +1,7 @@
 # wireproxy-rs
 
 Userspace WireGuard client in Rust that exposes SOCKS5/HTTP proxies and TCP tunnels
-without creating a TUN device. Built on `boringtun` + `tokio` with a pure userspace netstack.
+without creating a TUN device. Built on `gotatun` + `tokio` with a pure userspace netstack.
 
 ## Features
 
@@ -48,11 +48,11 @@ wireproxy-rs -i 127.0.0.1:9080 -c /path/to/wireproxy.conf
 [Interface]
 Address = 10.200.200.2/32
 PrivateKey = BASE64_PRIVATE_KEY
-DNS = 10.200.200.1
-# MTU = 1420
-# ListenPort = 51820
-# CheckAlive = 1.1.1.1,8.8.8.8
-# CheckAliveInterval = 5
+ DNS = 10.200.200.1
+ # MTU = 1420
+ # ListenPort = 51820
+ # CheckAlive = 1.1.1.1,8.8.8.8
+ # CheckAliveInterval = 5
 
 [Peer]
 PublicKey = BASE64_PUBLIC_KEY
@@ -105,4 +105,3 @@ Start with `-i host:port` to enable:
 - `AllowedIPs` defaults to `0.0.0.0/0, ::/0` when omitted (Go leaves it empty).
 - `[TCPClientTunnel].BindAddress` currently expects IP:port (hostnames not yet accepted).
 - INI parsing does not accept `key: value` or inline comments on the same line.
-
